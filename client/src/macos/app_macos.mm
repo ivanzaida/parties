@@ -58,6 +58,7 @@
 // Defined in auto_updater_macos.mm
 extern void macos_updater_init();
 extern void macos_updater_check_now();
+extern void macos_updater_check_in_background();
 #endif
 
 #include <atomic>
@@ -934,10 +935,80 @@ static int macos_modifiers_to_rml(NSEventModifierFlags flags)
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
     [NSApp activateIgnoringOtherApps:YES];
 
+    [self installMainMenu];
+
 #ifdef SPARKLE_ENABLED
     macos_updater_init();
+    // Proactively check shortly after launch so an available update is offered
+    // promptly, rather than only on Sparkle's periodic background schedule.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        macos_updater_check_in_background();
+    });
 #endif
 }
+
+// Build a minimal standard application menu. The app otherwise ships no menu
+// bar; this provides About / Hide / Quit and, crucially, a user-triggerable
+// "Check for Updates…" item wired to Sparkle.
+- (void)installMainMenu
+{
+    NSString* appName = [[NSProcessInfo processInfo] processName];
+
+    NSMenu* mainMenu = [[NSMenu alloc] init];
+    NSMenuItem* appMenuItem = [[NSMenuItem alloc] init];
+    [mainMenu addItem:appMenuItem];
+
+    NSMenu* appMenu = [[NSMenu alloc] init];
+    appMenuItem.submenu = appMenu;
+
+    [appMenu addItemWithTitle:[NSString stringWithFormat:@"About %@", appName]
+                       action:@selector(orderFrontStandardAboutPanel:)
+                keyEquivalent:@""];
+    [appMenu addItem:[NSMenuItem separatorItem]];
+
+#ifdef SPARKLE_ENABLED
+    NSMenuItem* updateItem =
+        [appMenu addItemWithTitle:@"Check for Updates…"
+                           action:@selector(checkForUpdatesAction:)
+                    keyEquivalent:@""];
+    updateItem.target = self;
+    [appMenu addItem:[NSMenuItem separatorItem]];
+#endif
+
+    NSMenuItem* hideItem =
+        [appMenu addItemWithTitle:[NSString stringWithFormat:@"Hide %@", appName]
+                           action:@selector(hide:)
+                    keyEquivalent:@"h"];
+    hideItem.keyEquivalentModifierMask = NSEventModifierFlagCommand;
+
+    NSMenuItem* hideOthers =
+        [appMenu addItemWithTitle:@"Hide Others"
+                           action:@selector(hideOtherApplications:)
+                    keyEquivalent:@"h"];
+    hideOthers.keyEquivalentModifierMask =
+        NSEventModifierFlagCommand | NSEventModifierFlagOption;
+
+    [appMenu addItemWithTitle:@"Show All"
+                       action:@selector(unhideAllApplications:)
+                keyEquivalent:@""];
+    [appMenu addItem:[NSMenuItem separatorItem]];
+
+    NSMenuItem* quitItem =
+        [appMenu addItemWithTitle:[NSString stringWithFormat:@"Quit %@", appName]
+                           action:@selector(terminate:)
+                    keyEquivalent:@"q"];
+    quitItem.keyEquivalentModifierMask = NSEventModifierFlagCommand;
+
+    NSApp.mainMenu = mainMenu;
+}
+
+#ifdef SPARKLE_ENABLED
+- (void)checkForUpdatesAction:(id)sender
+{
+    macos_updater_check_now();
+}
+#endif
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)sender
 {

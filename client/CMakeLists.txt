@@ -180,8 +180,13 @@ if(APPLE)
     set_target_properties(parties_client PROPERTIES
         MACOSX_BUNDLE TRUE
         MACOSX_BUNDLE_BUNDLE_NAME "Parties"
-        MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}"
-        MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
+        # Use the git-tag-derived version (e.g. 0.0.0.19), NOT PROJECT_VERSION,
+        # which is the hardcoded 0.1.0 from project(parties VERSION 0.1.0 ...).
+        # Sparkle compares the appcast's <sparkle:version> against CFBundleVersion;
+        # the appcast advertises the full 4-component tag, so CFBundleVersion must
+        # match token-for-token or every release looks "older" than the install.
+        MACOSX_BUNDLE_BUNDLE_VERSION "${PARTIES_VERSION_STR}"
+        MACOSX_BUNDLE_SHORT_VERSION_STRING "${PARTIES_VERSION_STR}"
         MACOSX_BUNDLE_COPYRIGHT "MIT License"
         XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY "Apple Development"
         XCODE_ATTRIBUTE_CODE_SIGN_STYLE "Automatic"

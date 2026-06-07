@@ -20,9 +20,21 @@ void macos_updater_init()
 #endif
 }
 
+// Explicit, user-initiated check. Shows Sparkle's full UI, including the
+// "you're up to date" dialog. Wire this to a "Check for Updates…" menu item.
 void macos_updater_check_now()
 {
 #ifdef SPARKLE_ENABLED
     [g_updaterController checkForUpdates:nil];
+#endif
+}
+
+// Silent background check. Only surfaces UI when an update is actually
+// available — ideal to call shortly after launch so an offer can appear
+// promptly without waiting for the scheduled interval.
+void macos_updater_check_in_background()
+{
+#ifdef SPARKLE_ENABLED
+    [g_updaterController.updater checkForUpdatesInBackground];
 #endif
 }
