@@ -444,6 +444,9 @@ void Server::handle_message(const IncomingMessage& msg) {
                 if (s->id != msg.session_id && s->authenticated &&
                     s->public_key == pubkey) {
                     LOG_INFO("Kicking duplicate session {} for user '{}' (id={})", s->id, s->username, s->user_id);
+                    // Tell the old session it was replaced so its client doesn't
+                    // try to auto-reconnect and ping-pong with the new session.
+                    send_error(s->id, "Signed in from another location");
                     on_client_disconnect(s->id);
                     quic_.disconnect(s->id);
                 }

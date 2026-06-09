@@ -60,6 +60,10 @@ public:
     // Active server tracking
     rml::Prop<int>         connected_server_id{0};
 
+    // Auto-reconnect banner (shown in the lobby while reconnecting)
+    rml::Prop<bool>        reconnecting{false};
+    rml::Prop<Rml::String> reconnect_status;
+
     // TOFU certificate warning
     rml::Prop<bool>        show_tofu_warning{false};
     rml::Prop<Rml::String> tofu_fingerprint;  // new (mismatched) fingerprint

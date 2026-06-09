@@ -94,6 +94,19 @@ public:
     // cleanup (which mutates the RmlUi data model) runs on the main thread in tick().
     std::atomic<bool> disconnect_pending_{false};
 
+    // ── Auto-reconnect ──────────────────────────────────────────────────────
+    // Set true by intentional disconnects (user action, kick, TOFU reject,
+    // shutdown) so the drop handler knows NOT to reconnect. Cleared after each
+    // disconnect is processed.
+    bool        intentional_disconnect_ = false;
+    bool        reconnecting_           = false;  // a reconnect cycle is in progress
+    int         reconnect_attempts_     = 0;      // pre-auth connect failures (backoff)
+    int         reconnect_flaps_        = 0;      // auth-succeeds-then-drops cycles (loop guard)
+    ChannelId   reconnect_channel_      = 0;      // voice channel to rejoin after re-auth
+    bool        rejoin_pending_         = false;  // re-auth succeeded → join reconnect_channel_
+    std::chrono::steady_clock::time_point reconnect_next_attempt_{};
+    std::chrono::steady_clock::time_point auth_success_time_{};  // last successful auth
+
     // Actions
     void watch_sharer(UserId id);
     void stop_watching();
@@ -116,6 +129,11 @@ public:
     void finish_connect();
     void send_auth_identity();
     void on_disconnect_cleanup();
+
+    // Auto-reconnect
+    void disconnect_intentionally();   // user/explicit disconnect — no reconnect
+    void attempt_reconnect();          // fire one reconnect attempt (called from tick)
+    void cancel_reconnect();           // abandon the reconnect cycle
 
     // Model callbacks (called from init())
     void setup_model_callbacks();

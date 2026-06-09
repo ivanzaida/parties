@@ -33,6 +33,8 @@ void ServerListModel::build(rml::Builder& b) {
      .bind("login_error",      login_error)
      .bind("login_status",     login_status)
      .bind("connected_server_id", connected_server_id)
+     .bind("reconnecting",      reconnecting)
+     .bind("reconnect_status",  reconnect_status)
      .bind("show_tofu_warning", show_tofu_warning)
      .bind("tofu_fingerprint",  tofu_fingerprint)
      .bind("show_onboarding",  show_onboarding)

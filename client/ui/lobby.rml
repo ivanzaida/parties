@@ -55,6 +55,12 @@
          ============================================================ -->
     <div class="home-screen" data-if="is_connected == false">
         <div class="home-inner" data-model="serverlist">
+            <!-- Auto-reconnect banner -->
+            <div class="reconnect-banner" data-if="reconnecting">
+                <span class="reconnect-spinner"></span>
+                <span class="reconnect-text">{{ reconnect_status }}</span>
+            </div>
+
             <!-- Party grid content -->
             <div class="home-content">
                 <div class="home-greeting">

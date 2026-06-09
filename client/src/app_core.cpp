@@ -31,6 +31,15 @@
 
 namespace parties::client {
 
+namespace {
+// Auto-reconnect backoff: 1s, 2s, 4s, 8s, 16s→capped at 15s. `attempts` is the
+// number of failures so far. Parenthesized to dodge the Windows min() macro.
+int reconnect_backoff_ms(int attempts) {
+    const int shift = (std::min)(attempts, 5);
+    return (std::min)(15000, 500 * (1 << shift));
+}
+} // namespace
+
 AppCore::AppCore() = default;
 AppCore::~AppCore() { stop_query_thread(); }
 
@@ -147,6 +156,8 @@ void AppCore::shutdown()
     updater_.reset();
 #endif
     stop_query_thread();
+    intentional_disconnect_ = true;
+    cancel_reconnect();
     net_.disconnect();
     audio_.stop();
     stream_audio_player_.shutdown();
@@ -168,6 +179,14 @@ void AppCore::tick()
     apply_query_results();
 
     if (awaiting_connection_) poll_connecting();
+
+    // Auto-reconnect: fire the next attempt once the backoff timer elapses and
+    // we aren't already mid-connect.
+    if (reconnecting_ && !awaiting_connection_ && !authenticated_ &&
+        std::chrono::steady_clock::now() >= reconnect_next_attempt_) {
+        attempt_reconnect();
+    }
+
     process_server_messages();
     update_speaking_state();
     flush_pending_prefs();
@@ -529,6 +548,9 @@ void AppCore::do_connect()
         return;
     }
 
+    // Manual connect supersedes any in-flight auto-reconnect.
+    cancel_reconnect();
+
     username_ = server_model_.login_username;
     server_password_ = std::string(server_model_.login_password);
     server_model_.login_error = "";
@@ -551,9 +573,19 @@ void AppCore::poll_connecting()
 {
     if (net_.connect_failed()) {
         awaiting_connection_ = false;
-        server_model_.login_error  = "Failed to connect to server";
-        server_model_.login_status = "";
         net_.disconnect();
+        if (reconnecting_) {
+            // Stay silent in the lobby banner; schedule the next attempt.
+            reconnect_attempts_++;
+            const int delay_ms = reconnect_backoff_ms(reconnect_attempts_);
+            reconnect_next_attempt_ = std::chrono::steady_clock::now()
+                                    + std::chrono::milliseconds(delay_ms);
+            server_model_.reconnect_status = Rml::String("Reconnecting… (attempt ")
+                + std::to_string(reconnect_attempts_ + 1).c_str() + ")";
+        } else {
+            server_model_.login_error  = "Failed to connect to server";
+            server_model_.login_status = "";
+        }
         return;
     }
     if (net_.is_connected()) {
@@ -615,17 +647,24 @@ void AppCore::send_auth_identity()
     writer.write_string(username_);
     writer.write_u64(now);
     writer.write_bytes(sig.data(), sig.size());
-    writer.write_string(std::string(server_model_.login_password));
+    // Use the cached server password (set by do_connect on a fresh login and by
+    // attempt_reconnect from saved settings) — the UI field is cleared/empty
+    // during an auto-reconnect, so we can't read it here.
+    writer.write_string(server_password_);
 
     net_.send_message(protocol::ControlMessageType::AUTH_IDENTITY,
                       writer.data().data(), writer.data().size());
 
-    // Clear password from memory after sending
+    // Clear password from the UI field after sending
     server_model_.login_password = "";
 }
 
 void AppCore::on_disconnect_cleanup()
 {
+    // Capture pre-reset state needed to decide whether (and how) to reconnect.
+    const bool was_authenticated = authenticated_;
+    const ChannelId prev_channel = current_channel_;
+
     authenticated_ = false;
     current_channel_ = 0;
     channel_key_ = {};
@@ -635,6 +674,12 @@ void AppCore::on_disconnect_cleanup()
     video_frame_number_ = 0;
     awaiting_connection_ = false;
     awaiting_channel_join_ = false;
+    pending_channel_id_ = 0;
+    // Per-connection counters/timers — reset so a reconnect starts clean
+    // rather than resuming sequence numbers / pending pings from the dead link.
+    voice_seq_ = 0;
+    ping_pending_ = false;
+    tofu_pending_ = false;
 
     audio_.stop();
     mixer_.clear();
@@ -685,6 +730,110 @@ void AppCore::on_disconnect_cleanup()
     server_model_.show_add_form       = false;
     server_model_.login_error         = "";
     server_model_.login_status        = "";
+
+    // ── Decide whether to auto-reconnect ────────────────────────────────────
+    if (intentional_disconnect_) {
+        // User/explicit teardown — do not reconnect.
+        cancel_reconnect();
+        intentional_disconnect_ = false;
+    } else if (was_authenticated && connecting_server_id_ != 0) {
+        // Unexpected drop while connected. Guard against reconnect loops: if a
+        // freshly re-authenticated session drops again almost immediately
+        // (e.g. a duplicate-login kicking us straight back out), count it as a
+        // "flap" and give up after a few rather than ping-ponging forever.
+        const auto session_dur = std::chrono::steady_clock::now() - auth_success_time_;
+        if (session_dur < std::chrono::seconds(5)) {
+            if (++reconnect_flaps_ >= 4) {
+                LOG_WARN("Auto-reconnect: session keeps dropping; giving up");
+                cancel_reconnect();
+                reconnect_flaps_ = 0;
+                server_model_.login_error = "Disconnected (are you signed in elsewhere?)";
+                intentional_disconnect_ = false;
+                return;
+            }
+        } else {
+            reconnect_flaps_ = 0;
+        }
+        reconnecting_           = true;
+        reconnect_attempts_     = 0;
+        reconnect_channel_      = prev_channel;
+        rejoin_pending_         = false;
+        reconnect_next_attempt_ = std::chrono::steady_clock::now()
+                                + std::chrono::milliseconds(500);
+        server_model_.reconnecting     = true;
+        server_model_.reconnect_status = "Connection lost — reconnecting…";
+        LOG_WARN("Connection lost; auto-reconnect armed (channel {})", prev_channel);
+    } else if (reconnecting_) {
+        // A reconnect attempt failed before authentication completed.
+        // Schedule the next attempt with capped exponential backoff.
+        reconnect_attempts_++;
+        const int delay_ms = reconnect_backoff_ms(reconnect_attempts_);
+        reconnect_next_attempt_ = std::chrono::steady_clock::now()
+                                + std::chrono::milliseconds(delay_ms);
+        server_model_.reconnecting     = true;
+        server_model_.reconnect_status = Rml::String("Reconnecting… (attempt ")
+            + std::to_string(reconnect_attempts_ + 1).c_str() + ")";
+        LOG_INFO("Reconnect attempt {} failed; retrying in {} ms",
+                 reconnect_attempts_, delay_ms);
+    }
+}
+
+void AppCore::disconnect_intentionally()
+{
+    intentional_disconnect_ = true;
+    cancel_reconnect();
+    net_.disconnect();
+}
+
+void AppCore::cancel_reconnect()
+{
+    reconnecting_       = false;
+    rejoin_pending_     = false;
+    reconnect_attempts_ = 0;
+    reconnect_channel_  = 0;
+    server_model_.reconnecting     = false;
+    server_model_.reconnect_status = "";
+}
+
+void AppCore::attempt_reconnect()
+{
+    // Reload saved credentials for the server we were connected to. They
+    // persist in settings across the disconnect cleanup.
+    const SavedServer* match = nullptr;
+    auto saved = settings_.get_saved_servers();
+    for (auto& srv : saved) {
+        if (srv.id == connecting_server_id_) { match = &srv; break; }
+    }
+    if (!match) {
+        LOG_WARN("Auto-reconnect: saved server {} gone; giving up", connecting_server_id_);
+        cancel_reconnect();
+        return;
+    }
+
+    username_        = match->last_username;
+    server_password_ = match->password;
+    server_host_     = match->host;
+    server_port_     = static_cast<uint16_t>(match->port);
+
+    LOG_INFO("Auto-reconnect: dialing {}:{} (attempt {})",
+             server_host_, server_port_, reconnect_attempts_ + 1);
+
+    auto ticket = settings_.load_resumption_ticket(server_host_, server_port_);
+    if (!net_.connect(server_host_, server_port_,
+                      ticket.empty() ? nullptr : ticket.data(), ticket.size())) {
+        // connect() failed synchronously — schedule the next attempt.
+        reconnect_attempts_++;
+        const int delay_ms = reconnect_backoff_ms(reconnect_attempts_);
+        reconnect_next_attempt_ = std::chrono::steady_clock::now()
+                                + std::chrono::milliseconds(delay_ms);
+        server_model_.reconnect_status = Rml::String("Reconnecting… (attempt ")
+            + std::to_string(reconnect_attempts_ + 1).c_str() + ")";
+        return;
+    }
+
+    awaiting_connection_ = true;
+    rejoin_pending_      = (reconnect_channel_ != 0);
+    server_model_.reconnect_status = "Reconnecting…";
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -911,6 +1060,7 @@ void AppCore::on_auth_response(const uint8_t* data, size_t len)
     if (reader.error()) return;
 
     authenticated_ = true;
+    auth_success_time_ = std::chrono::steady_clock::now();
 
     settings_.save_server(server_name, server_host_, server_port_,
                           net_.get_server_fingerprint(), username_, server_password_);
@@ -960,6 +1110,20 @@ void AppCore::on_auth_response(const uint8_t* data, size_t len)
         play_devices.push_back({Rml::String(d.name), d.index});
     model_.capture_devices.notify();
     model_.playback_devices.notify();
+
+    // ── Auto-reconnect: rejoin the last voice channel and clear the banner ──
+    if (rejoin_pending_) {
+        rejoin_pending_ = false;
+        const ChannelId ch = reconnect_channel_;
+        cancel_reconnect();
+        if (ch != 0) {
+            LOG_INFO("Auto-reconnect: rejoining channel {}", ch);
+            join_channel(ch);
+        }
+    } else {
+        // A fresh, manual login — make sure no stale reconnect state lingers.
+        cancel_reconnect();
+    }
 }
 
 void AppCore::on_channel_list(const uint8_t* data, size_t len)
@@ -1269,6 +1433,17 @@ void AppCore::on_server_error(const uint8_t* data, size_t len)
 
     LOG_ERROR("Server error: {}", msg);
 
+    // Terminal, server-initiated disconnects (admin kick, or being replaced by
+    // a login from elsewhere) arrive as an error immediately followed by a
+    // transport drop. Mark the upcoming drop intentional so we don't fight it.
+    if (authenticated_ &&
+        (msg.find("kicked") != std::string::npos ||
+         msg.find("another location") != std::string::npos)) {
+        intentional_disconnect_ = true;
+        if (bridge_.play_sound)
+            bridge_.play_sound(SoundPlayer::Effect::ServerDisconnected);
+    }
+
     if (server_model_.show_login) {
         server_model_.login_error  = Rml::String(msg);
         server_model_.login_status = "";
@@ -1375,7 +1550,7 @@ void AppCore::flush_pending_prefs(bool force)
 
 void AppCore::setup_model_callbacks()
 {
-    model_.on_disconnect_server = [this]() { net_.disconnect(); };
+    model_.on_disconnect_server = [this]() { disconnect_intentionally(); };
     model_.on_join_channel  = [this](int id) { join_channel(static_cast<ChannelId>(id)); };
     model_.on_leave_channel = [this]()       { leave_channel(); };
 
@@ -1709,7 +1884,7 @@ void AppCore::setup_server_model_callbacks()
 
     server_model_.on_cancel_login = [this]() {
         server_model_.show_login = false;
-        net_.disconnect();
+        disconnect_intentionally();
         awaiting_connection_ = false;
     };
 
@@ -1826,7 +2001,7 @@ void AppCore::setup_server_model_callbacks()
         tofu_pending_ = false;
         server_model_.show_tofu_warning = false;
         server_model_.show_login        = false;
-        net_.disconnect();
+        disconnect_intentionally();
     };
 }
 

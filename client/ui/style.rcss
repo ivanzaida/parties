@@ -358,6 +358,34 @@ body {
     padding: 24dp 32dp;
 }
 
+/* Auto-reconnect banner */
+.reconnect-banner {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 10dp;
+    flex: none;
+    margin-bottom: 18dp;
+    padding: 12dp 16dp;
+    background-color: #2A2D45;
+    border: 1dp #4A4F73;
+    border-radius: 8dp;
+}
+
+.reconnect-spinner {
+    display: block;
+    width: 12dp;
+    height: 12dp;
+    border-radius: 6dp;
+    background-color: #E0A53B;
+}
+
+.reconnect-text {
+    font-size: 14dp;
+    font-weight: bold;
+    color: #E8EAF2;
+}
+
 .home-topbar {
     display: flex;
     flex-direction: row;

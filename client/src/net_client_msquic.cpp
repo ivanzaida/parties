@@ -62,6 +62,14 @@ struct NetClient::Impl {
             return false;
         }
 
+        // A prior connection (e.g. one that dropped) may have left its QUIC
+        // handles allocated — on_disconnected/SHUTDOWN_COMPLETE clears the
+        // stream pointers but not registration/configuration/connection. Close
+        // them before opening new ones so a reconnect can't leak the old set.
+        control_stream = nullptr;
+        video_stream   = nullptr;
+        cleanup_handles();
+
         QUIC_STATUS status;
 
         QUIC_REGISTRATION_CONFIG reg_cfg = { "parties_client", QUIC_EXECUTION_PROFILE_LOW_LATENCY };
