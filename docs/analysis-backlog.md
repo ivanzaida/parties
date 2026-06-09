@@ -4,6 +4,13 @@ Generated 2026-06-10 from a full architecture + network-protocol review. Each
 item has a location, the problem, and a concrete recommendation. Priorities:
 **Critical** (do soon), **High**, **Medium**, **Low**.
 
+## Status (2026-06-10)
+Fixed in the security/robustness pass: **S1, S2, S4, S5, S3 (replay-cache
+variant), S9, S11, R1, R4, C1, C2, H2, H3, H4.** The one remaining High item,
+**E3** (move bulk chat off the control stream), is deferred — see the note at
+its entry below for why and the implementation plan. Everything else
+(Medium/Low + H1 god-object refactor) remains open.
+
 The transport foundation is solid — MsQuic + QUIC TLS 1.3, bounds-checked
 `BinaryReader`, server-stamped sender IDs, length caps on every frame. The
 issues are concentrated in application-layer trust decisions, one non-functional
@@ -99,10 +106,33 @@ issues are concentrated in application-layer trust decisions, one non-functional
 - **E1 (Medium) — Two heap allocations per outbound message** (`new uint8_t[]` +
   `new QUIC_BUFFER`) on every send incl. the SFU fan-out hot path. Pool the
   buffer+data blocks; for fan-out, the bytes are identical across recipients.
-- **E3 (High) — Chat bulk traffic shares the control stream** → head-of-line
-  blocking. A large `CHAT_HISTORY_RESP`/`CHAT_SEARCH_RESP` blocks presence/
-  voice-state messages behind it. Move bulk request-response chat onto a
-  separate QUIC stream.
+- **E3 (High, DEFERRED) — Chat bulk traffic shares the control stream** →
+  head-of-line blocking. A large `CHAT_HISTORY_RESP`/`CHAT_SEARCH_RESP` blocks
+  presence/voice-state messages behind it on the single ordered control stream.
+  **Why deferred:** the safe fix is a transport-layer change (a new persistent
+  stream) that also requires fixing the positional stream-role assignment (R5);
+  it touches the file-transfer 3rd-stream path and chat delivery, and the
+  integration test has **no chat coverage**, so it can't be verified headlessly.
+  Landing it unverified alongside the security pass risked regressing chat/file
+  transfer. **Plan (additive, backward-compatible):**
+  1. Add `STREAM_TYPE_BULK = 0x12` (first byte) in protocol.h, alongside the
+     file-stream type bytes.
+  2. Client: after opening control (stream 0) + video (stream 1), open a third
+     persistent bidirectional stream, send `STREAM_TYPE_BULK` as its first byte,
+     and route its receives into `incoming()` exactly like the control stream.
+     Store it as `bulk_stream`.
+  3. Server `PEER_STREAM_STARTED`: the 3rd+ stream already routes to
+     `file_stream_callback`, which reads a type byte. Branch there: a
+     `STREAM_TYPE_BULK` stream is registered as `session->quic_bulk_stream` and
+     its data is fed to `process_stream_data` (same control parser); file types
+     keep today's behavior. This fixes R5 for the bulk stream specifically.
+  4. Server: send `CHAT_HISTORY_RESP`, `CHAT_SEARCH_RESP`, `CHAT_PINNED_RESP`,
+     `CHAT_CHANNEL_LIST`, and chat-history `CHAT_MESSAGE`s on
+     `quic_bulk_stream` **if present, else fall back to the control stream** (so
+     an older client still works). Latency-sensitive presence/voice-state stays
+     on stream 0.
+  5. Verify by extending the integration test with a chat history round-trip,
+     plus a manual chat smoke test.
 - **E4 (Medium) — Voice fan-out is O(M·N) per packet** (`server.cpp:169-180`
   snapshots all sessions per datagram). Maintain a per-channel membership index.
 - **E2 (Low)** — `buffer.erase(begin, begin+n)` after each parsed frame is O(n)
