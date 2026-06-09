@@ -139,6 +139,13 @@ public:
     // Send raw data on a file stream and close it with FIN
     bool send_file_on_stream(HQUIC stream, const uint8_t* data, size_t len);
 
+    // Cumulative count of failed reliable (control + video stream) sends. The
+    // main loop logs this periodically so silent backpressure/teardown drops
+    // are observable.
+    uint64_t reliable_send_failures() const {
+        return reliable_send_failures_.load(std::memory_order_relaxed);
+    }
+
 private:
     // MsQuic callback functions (static, forward to member via context)
     static QUIC_STATUS QUIC_API listener_callback(HQUIC listener, void* context,
@@ -181,6 +188,8 @@ private:
     std::mutex sessions_mutex_;
     std::unordered_map<uint32_t, std::shared_ptr<Session>> sessions_;
     uint32_t next_session_id_ = 1;
+
+    std::atomic<uint64_t> reliable_send_failures_{0};
 
     // Connectionless server-query info (set before start(), read on MsQuic thread)
     std::string query_server_name_;

@@ -96,6 +96,7 @@ bool Server::start(const Config& cfg) {
 
 void Server::run() {
     auto last_retention_check = std::chrono::steady_clock::now();
+    uint64_t last_send_failures_ = 0;
 
     while (running_) {
         ZoneScopedN("Server::run");
@@ -108,6 +109,15 @@ void Server::run() {
         auto now = std::chrono::steady_clock::now();
         if (now - last_retention_check > std::chrono::seconds(60)) {
             last_retention_check = now;
+
+            // Surface silent reliable-send drops (backpressure / teardown races).
+            uint64_t fails = quic_.reliable_send_failures();
+            if (fails > last_send_failures_) {
+                LOG_WARN("{} reliable send(s) failed in the last interval (total {})",
+                         fails - last_send_failures_, fails);
+                last_send_failures_ = fails;
+            }
+
             if (config_.chat.message_retention_days > 0) {
                 int purged = db_.purge_old_messages(config_.chat.message_retention_days);
                 if (purged > 0)

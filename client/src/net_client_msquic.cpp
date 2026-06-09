@@ -15,6 +15,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <mutex>
 #include <thread>
@@ -38,6 +39,12 @@ struct NetClient::Impl {
     std::atomic<bool> connecting{false};
     std::atomic<bool> connect_failed_{false};
     std::mutex        write_mutex;
+
+    // Signalled from the connection callback on SHUTDOWN_COMPLETE so disconnect()
+    // can wait for shutdown to finish instead of sleeping a fixed interval.
+    std::mutex              shutdown_mutex;
+    std::condition_variable shutdown_cv;
+    bool                    shutdown_complete = false;
 
     std::mutex           buffer_mutex;
     std::vector<uint8_t> recv_buffer;
@@ -148,8 +155,14 @@ struct NetClient::Impl {
         connect_failed_ = false;
 
         if (connection) {
+            { std::lock_guard lock(shutdown_mutex); shutdown_complete = false; }
             api->ConnectionShutdown(connection, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            // Wait for SHUTDOWN_COMPLETE rather than sleeping a fixed interval —
+            // proceed anyway after a bounded timeout so we never hang on a wedged
+            // connection.
+            std::unique_lock lock(shutdown_mutex);
+            shutdown_cv.wait_for(lock, std::chrono::milliseconds(500),
+                                 [this] { return shutdown_complete; });
         }
 
         control_stream = nullptr;
@@ -316,6 +329,8 @@ struct NetClient::Impl {
             if (connecting) connect_failed_ = true;
             connecting = false; connected = false;
             control_stream = nullptr; video_stream = nullptr;
+            { std::lock_guard lock(shutdown_mutex); shutdown_complete = true; }
+            shutdown_cv.notify_all();
             if (parent.on_disconnected) parent.on_disconnected();
             break;
 

@@ -109,8 +109,12 @@ bool AppCore::init(const std::string& settings_path, PlatformBridge bridge, Rml:
         }
     };
 
+    // Fires on the MsQuic worker thread — don't touch sqlite here. Stash the
+    // bytes; tick() persists them on the main thread.
     net_.on_resumption_ticket = [this](const uint8_t* ticket, size_t len) {
-        settings_.save_resumption_ticket(server_host_, server_port_, ticket, len);
+        std::lock_guard<std::mutex> lock(pending_ticket_mutex_);
+        pending_resumption_ticket_.assign(ticket, ticket + len);
+        pending_ticket_dirty_ = true;
     };
 
     // Apply saved per-user prefs whenever the mixer creates a new stream
@@ -173,6 +177,21 @@ void AppCore::tick()
 {
     if (disconnect_pending_.exchange(false, std::memory_order_acquire))
         on_disconnect_cleanup();
+
+    // Persist a resumption ticket received on the QUIC worker thread.
+    {
+        std::vector<uint8_t> ticket;
+        {
+            std::lock_guard<std::mutex> lock(pending_ticket_mutex_);
+            if (pending_ticket_dirty_) {
+                ticket.swap(pending_resumption_ticket_);
+                pending_ticket_dirty_ = false;
+            }
+        }
+        if (!ticket.empty())
+            settings_.save_resumption_ticket(server_host_, server_port_,
+                                             ticket.data(), ticket.size());
+    }
 
     // Server-list status polling runs only while the lobby is visible.
     lobby_visible_.store(!authenticated_, std::memory_order_relaxed);

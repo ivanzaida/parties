@@ -278,6 +278,7 @@ bool QuicServer::send_video_to(uint32_t session_id, const uint8_t* data, size_t 
     if (QUIC_FAILED(status)) {
         delete[] buf_data;
         delete quic_buf;
+        reliable_send_failures_.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
     return true;
@@ -618,6 +619,7 @@ bool QuicServer::send_control_on_stream(HQUIC stream,
     if (QUIC_FAILED(status)) {
         delete[] buf_data;
         delete quic_buf;
+        reliable_send_failures_.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
     return true;

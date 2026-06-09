@@ -83,8 +83,10 @@ public:
     bool        awaiting_channel_join_ = false;
     ChannelId   pending_channel_id_    = 0;
     uint16_t    voice_seq_             = 0;
-    UserId      viewing_sharer_        = 0;
-    bool        awaiting_keyframe_     = false;
+    // Read on the MsQuic worker thread (video receive) and written on the main
+    // thread (watch/stop) — must be atomic.
+    std::atomic<UserId> viewing_sharer_{0};
+    std::atomic<bool>   awaiting_keyframe_{false};
     uint32_t    video_frame_number_    = 0;
     std::atomic<uint32_t> stream_frame_count_{0};
     std::string tofu_pending_fingerprint_;
@@ -92,6 +94,13 @@ public:
     // Set on the MsQuic worker thread when the connection drops; the actual
     // cleanup (which mutates the RmlUi data model) runs on the main thread in tick().
     std::atomic<bool> disconnect_pending_{false};
+
+    // Resumption ticket arrives on the MsQuic worker thread; sqlite (settings_)
+    // is not safe to touch off the main thread, so stash the bytes here and
+    // persist them from tick().
+    std::mutex           pending_ticket_mutex_;
+    std::vector<uint8_t> pending_resumption_ticket_;
+    bool                 pending_ticket_dirty_ = false;
 
     // ── Auto-reconnect ──────────────────────────────────────────────────────
     // Set true by intentional disconnects (user action, kick, TOFU reject,
