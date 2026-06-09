@@ -75,7 +75,6 @@ public:
     std::string server_password_;
     int         connecting_server_id_ = 0;
     ChannelId   current_channel_      = 0;
-    ChannelKey  channel_key_{};
     SecretKey   secret_key_{};
     PublicKey   public_key_{};
     bool        has_identity_         = false;
@@ -189,7 +188,6 @@ private:
     void on_user_left(const uint8_t* data, size_t len);
     void on_user_voice_state(const uint8_t* data, size_t len);
     void on_user_role_changed(const uint8_t* data, size_t len);
-    void on_channel_key(const uint8_t* data, size_t len);
     void on_screen_share_started(const uint8_t* data, size_t len);
     void on_screen_share_stopped(const uint8_t* data, size_t len);
     void on_screen_share_denied(const uint8_t* data, size_t len);

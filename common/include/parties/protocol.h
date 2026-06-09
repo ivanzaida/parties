@@ -6,9 +6,35 @@ namespace parties::protocol {
 
 constexpr uint16_t DEFAULT_PORT = 7800;
 
-// Protocol wire version — increment MINOR for backwards-compatible additions,
-// increment MAJOR for breaking changes. Sent in AUTH_IDENTITY.
-constexpr uint16_t PROTOCOL_VERSION = 1;
+// Protocol wire version. Increment MINOR for backwards-compatible additions
+// (new optional message types/fields), MAJOR for breaking changes. The two are
+// packed into one u16 (major in the high byte, minor in the low byte) and sent
+// in AUTH_IDENTITY. The server rejects only on a MAJOR mismatch, so a minor
+// bump doesn't lock out older clients.
+constexpr uint8_t  PROTOCOL_VERSION_MAJOR = 1;
+constexpr uint8_t  PROTOCOL_VERSION_MINOR = 0;
+constexpr uint16_t PROTOCOL_VERSION =
+    (static_cast<uint16_t>(PROTOCOL_VERSION_MAJOR) << 8) | PROTOCOL_VERSION_MINOR;
+
+constexpr uint8_t protocol_major(uint16_t version) { return static_cast<uint8_t>(version >> 8); }
+constexpr uint8_t protocol_minor(uint16_t version) { return static_cast<uint8_t>(version & 0xFF); }
+
+// SERVER_ERROR payload: [code(u16)][message(string)]. The code lets the client
+// react programmatically (retry vs. update vs. give up) instead of parsing the
+// human-readable string.
+enum class ServerErrorCode : uint16_t {
+    Generic          = 0,
+    BadVersion       = 1,   // incompatible protocol major
+    BadAuth          = 2,   // malformed message / bad signature / stale timestamp
+    BadPassword      = 3,
+    Kicked           = 4,   // removed by an admin
+    Replaced         = 5,   // a newer login for the same identity took over
+    RateLimited      = 6,
+    NotFound         = 7,
+    TooLarge         = 8,
+    PermissionDenied = 9,
+    Internal         = 10,
+};
 
 enum class ControlMessageType : uint16_t {
     // Client -> Server
@@ -31,7 +57,8 @@ enum class ControlMessageType : uint16_t {
     USER_VOICE_STATE      = 0x0106,
     USER_ROLE_CHANGED     = 0x0108,   // [user_id(4)][new_role(1)]
     KEEPALIVE_PONG        = 0x0107,
-    CHANNEL_KEY           = 0x0109,
+    // 0x0109 was CHANNEL_KEY — removed (was dead crypto; media is protected by
+    // QUIC TLS hop-by-hop, the SFU is trusted). Do not reuse without a bump.
     SCREEN_SHARE_STARTED  = 0x010A,
     SCREEN_SHARE_STOPPED  = 0x010B,
     SCREEN_SHARE_DENIED   = 0x010C,

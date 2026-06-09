@@ -11,8 +11,13 @@ namespace parties {
 bool crypto_init();
 void crypto_cleanup();
 
-// Generate cryptographically random bytes
-void random_bytes(uint8_t* out, size_t len);
+// Generate cryptographically random bytes. Returns false if the CSPRNG failed
+// (the buffer must NOT be used in that case).
+bool random_bytes(uint8_t* out, size_t len);
+
+// Constant-time string equality (length + content). Use for secrets/passwords
+// so comparison time doesn't leak how much of the value matched.
+bool constant_time_equals(const std::string& a, const std::string& b);
 
 // Compute SHA-256 hash, return hex-with-colons string
 std::string sha256_hex(const uint8_t* data, size_t len);

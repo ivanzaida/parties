@@ -58,7 +58,11 @@ bool QuicServer::start(const std::string& listen_ip, uint16_t port, size_t max_c
     settings.IsSet.PeerBidiStreamCount = TRUE;
     settings.DatagramReceiveEnabled = TRUE;
     settings.IsSet.DatagramReceiveEnabled = TRUE;
-    settings.ServerResumptionLevel = QUIC_SERVER_RESUME_AND_ZERORTT;
+    // Session resumption (fast reconnect via ticket) but NOT 0-RTT: TLS 1.3
+    // early data is replayable, and our only early message (AUTH_IDENTITY) must
+    // not be replayable. RESUME_ONLY keeps the latency win of resumption without
+    // accepting replayable early data.
+    settings.ServerResumptionLevel = QUIC_SERVER_RESUME_ONLY;
     settings.IsSet.ServerResumptionLevel = TRUE;
     // Low-latency: disable send buffering (flush immediately) and pacing
     settings.SendBufferingEnabled = FALSE;
@@ -493,13 +497,17 @@ QUIC_STATUS QuicServer::on_connection_event(HQUIC connection, uint32_t session_i
     case QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE: {
         LOG_INFO("Session {} shutdown complete", session_id);
 
-        // Notify disconnect callback
-        if (on_disconnect)
-            on_disconnect(session_id);
-
-        // Remove session
+        // Capture the fields the main loop needs to broadcast the departure,
+        // then hand off via the queue. Doing this under sessions_mutex_ (and
+        // never mutating Session here) keeps all disconnect-time Session access
+        // on the main thread, eliminating the worker/main-loop race.
         {
             std::lock_guard<std::mutex> lock(sessions_mutex_);
+            auto it = sessions_.find(session_id);
+            if (it != sessions_.end() && it->second->authenticated) {
+                disconnects_.push(SessionDisconnect{
+                    session_id, it->second->user_id, it->second->channel_id});
+            }
             sessions_.erase(session_id);
         }
         {

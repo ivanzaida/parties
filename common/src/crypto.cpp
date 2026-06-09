@@ -28,8 +28,24 @@ void crypto_cleanup() {
     g_initialized = false;
 }
 
-void random_bytes(uint8_t* out, size_t len) {
-    RAND_bytes(out, static_cast<int>(len));
+bool random_bytes(uint8_t* out, size_t len) {
+    if (RAND_bytes(out, static_cast<int>(len)) != 1) {
+        // CSPRNG failure — do not leave the buffer with predictable/uninitialized
+        // bytes for callers that don't check (zero it so misuse is at least
+        // deterministic, and signal failure).
+        std::memset(out, 0, len);
+        return false;
+    }
+    return true;
+}
+
+bool constant_time_equals(const std::string& a, const std::string& b) {
+    if (a.size() != b.size())
+        return false;
+    unsigned char diff = 0;
+    for (size_t i = 0; i < a.size(); ++i)
+        diff |= static_cast<unsigned char>(a[i]) ^ static_cast<unsigned char>(b[i]);
+    return diff == 0;
 }
 
 std::string sha256_hex(const uint8_t* data, size_t len) {

@@ -10,6 +10,7 @@
 #include <parties/log.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstring>
 #include <ctime>
@@ -61,10 +62,6 @@ bool Server::start(const Config& cfg) {
         return false;
     }
 
-    quic_.on_disconnect = [this](uint32_t session_id) {
-        on_client_disconnect(session_id);
-    };
-
     // Forward video frames directly from QUIC receive thread,
     // bypassing the polling loop to eliminate up to 1ms latency per frame.
     quic_.on_video_frame = [this](uint32_t session_id, uint8_t packet_type,
@@ -105,6 +102,7 @@ void Server::run() {
         process_control_messages();
         process_data_packets();
         process_file_transfers();
+        process_disconnects();
 
         // Periodic retention enforcement (every 60 seconds)
         auto now = std::chrono::steady_clock::now();
@@ -207,6 +205,16 @@ void Server::process_file_transfers() {
         }
         if (att->uploaded) continue;  // already uploaded
 
+        // Ownership check: only the author of the message that owns this
+        // attachment may supply its bytes. Otherwise any authenticated user who
+        // learns a pending attachment_id could fill it with arbitrary content.
+        auto owner_msg = db_.get_message(att->message_id);
+        if (!owner_msg || owner_msg->sender_id != session->user_id) {
+            LOG_WARN("Upload for attachment {} rejected: session {} (user {}) is not the message author",
+                     ev.attachment_id, ev.session_id, session->user_id);
+            continue;
+        }
+
         // Check file size limit
         if (static_cast<int64_t>(ev.data.size()) > config_.chat.max_file_size) {
             LOG_WARN("File too large ({} bytes) from session {}", ev.data.size(), ev.session_id);
@@ -271,8 +279,10 @@ void Server::process_file_transfers() {
     }
 }
 
-void Server::send_error(uint32_t session_id, const std::string& message) {
+void Server::send_error(uint32_t session_id, const std::string& message,
+                        protocol::ServerErrorCode code) {
     BinaryWriter writer;
+    writer.write_u16(static_cast<uint16_t>(code));
     writer.write_string(message);
     quic_.send_to(session_id, protocol::ControlMessageType::SERVER_ERROR,
                  writer.data().data(), writer.data().size());
@@ -332,16 +342,20 @@ void Server::handle_message(const IncomingMessage& msg) {
 
         BinaryReader reader(msg.payload.data(), msg.payload.size());
 
-        // Check protocol version
+        // Check protocol version — reject only on a MAJOR mismatch so minor
+        // (backwards-compatible) bumps don't lock out older clients.
         uint16_t client_version = reader.read_u16();
         if (reader.error()) {
-            send_error(msg.session_id, "Malformed auth message");
+            send_error(msg.session_id, "Malformed auth message",
+                       protocol::ServerErrorCode::BadAuth);
             break;
         }
-        if (client_version != protocol::PROTOCOL_VERSION) {
-            LOG_WARN("Protocol version mismatch: server={}, client={}", protocol::PROTOCOL_VERSION, client_version);
-            send_error(msg.session_id, std::format("Protocol version mismatch: server={}, client={}",
-                protocol::PROTOCOL_VERSION, client_version));
+        if (protocol::protocol_major(client_version) != protocol::PROTOCOL_VERSION_MAJOR) {
+            LOG_WARN("Protocol major mismatch: server={}, client={}",
+                     protocol::PROTOCOL_VERSION_MAJOR, protocol::protocol_major(client_version));
+            send_error(msg.session_id, std::format("Incompatible protocol version (server major {}, client major {})",
+                protocol::PROTOCOL_VERSION_MAJOR, protocol::protocol_major(client_version)),
+                protocol::ServerErrorCode::BadVersion);
             break;
         }
 
@@ -353,16 +367,42 @@ void Server::handle_message(const IncomingMessage& msg) {
         Signature sig{};
         reader.read_bytes(sig.data(), 64);
         if (reader.error()) {
-            send_error(msg.session_id, "Malformed auth message");
+            send_error(msg.session_id, "Malformed auth message",
+                       protocol::ServerErrorCode::BadAuth);
             break;
         }
 
-        // Verify timestamp is within ±60 seconds
+        // Verify timestamp freshness (±30s window).
+        constexpr int64_t kAuthWindowSec = 30;
         auto now = static_cast<uint64_t>(std::time(nullptr));
         int64_t diff = static_cast<int64_t>(now) - static_cast<int64_t>(timestamp);
-        if (diff > 60 || diff < -60) {
-            send_error(msg.session_id, "Auth timestamp out of range");
+        if (diff > kAuthWindowSec || diff < -kAuthWindowSec) {
+            send_error(msg.session_id, "Auth timestamp out of range",
+                       protocol::ServerErrorCode::BadAuth);
             break;
+        }
+
+        Fingerprint fp = parties::public_key_fingerprint(pubkey);
+
+        // Replay guard: a captured AUTH_IDENTITY reuses its (pubkey, timestamp)
+        // pair and Ed25519 signature. Require a strictly newer timestamp than
+        // the last one we accepted for this identity — legit re-auths use the
+        // current time, replays reuse the stale one. Prune stale entries so the
+        // map stays bounded by the active identity count.
+        {
+            for (auto it = recent_auth_.begin(); it != recent_auth_.end(); ) {
+                if (static_cast<int64_t>(now) - static_cast<int64_t>(it->second) > kAuthWindowSec)
+                    it = recent_auth_.erase(it);
+                else
+                    ++it;
+            }
+            auto seen = recent_auth_.find(fp);
+            if (seen != recent_auth_.end() && timestamp <= seen->second) {
+                LOG_WARN("Replayed/stale auth from fp={} (ts={}, last={})", fp, timestamp, seen->second);
+                send_error(msg.session_id, "Stale authentication; please retry",
+                           protocol::ServerErrorCode::BadAuth);
+                break;
+            }
         }
 
         // Reconstruct signed message: pubkey(32) + display_name + timestamp(8)
@@ -374,7 +414,8 @@ void Server::handle_message(const IncomingMessage& msg) {
         // Verify Ed25519 signature
         if (!parties::ed25519_verify(sig_msg.data().data(), sig_msg.data().size(),
                                       sig, pubkey)) {
-            send_error(msg.session_id, "Invalid signature");
+            send_error(msg.session_id, "Invalid signature",
+                       protocol::ServerErrorCode::BadAuth);
             break;
         }
 
@@ -383,15 +424,17 @@ void Server::handle_message(const IncomingMessage& msg) {
         if (!reader.error() && reader.remaining() > 0)
             client_password = reader.read_string();
 
-        // Verify server password if configured
+        // Verify server password if configured (constant-time compare)
         if (!config_.server_password.empty()) {
-            if (client_password != config_.server_password) {
-                send_error(msg.session_id, "Incorrect server password");
+            if (!parties::constant_time_equals(client_password, config_.server_password)) {
+                send_error(msg.session_id, "Incorrect server password",
+                           protocol::ServerErrorCode::BadPassword);
                 break;
             }
         }
 
-        Fingerprint fp = parties::public_key_fingerprint(pubkey);
+        // Accept: record the timestamp for the replay guard.
+        recent_auth_[fp] = timestamp;
         LOG_INFO("Auth from session {}: name='{}' fp={}", msg.session_id, display_name, fp);
 
         // Look up or auto-create user
@@ -446,8 +489,14 @@ void Server::handle_message(const IncomingMessage& msg) {
                     LOG_INFO("Kicking duplicate session {} for user '{}' (id={})", s->id, s->username, s->user_id);
                     // Tell the old session it was replaced so its client doesn't
                     // try to auto-reconnect and ping-pong with the new session.
-                    send_error(s->id, "Signed in from another location");
-                    on_client_disconnect(s->id);
+                    send_error(s->id, "Signed in from another location",
+                               protocol::ServerErrorCode::Replaced);
+                    // Broadcast its departure now; the QUIC SHUTDOWN_COMPLETE
+                    // path is idempotent (channel_id is captured there, and we
+                    // clear it below so it won't double-broadcast).
+                    process_disconnect(s->id, s->user_id, s->channel_id);
+                    s->channel_id = 0;
+                    s->authenticated = false;
                     quic_.disconnect(s->id);
                 }
             }
@@ -600,9 +649,6 @@ void Server::handle_message(const IncomingMessage& msg) {
             quic_.send_to(msg.session_id, protocol::ControlMessageType::CHANNEL_USER_LIST,
                          list_writer.data().data(), list_writer.data().size());
         }
-
-        // Send channel encryption key
-        send_channel_key(msg.session_id, channel_id);
 
         // Notify new joiner about all active screen sharers in this channel
         {
@@ -894,7 +940,8 @@ void Server::handle_message(const IncomingMessage& msg) {
 
         Role user_role = static_cast<Role>(session->role);
         if (!has_permission(user_role, Permission::KickFromServer)) {
-            send_error(msg.session_id, "Permission denied");
+            send_error(msg.session_id, "Permission denied",
+                       protocol::ServerErrorCode::PermissionDenied);
             break;
         }
 
@@ -907,10 +954,12 @@ void Server::handle_message(const IncomingMessage& msg) {
         for (auto& s : all) {
             if (s->user_id == target_id && s->authenticated) {
                 if (!can_moderate(user_role, static_cast<Role>(s->role))) {
-                    send_error(msg.session_id, "Cannot kick a user with equal or higher role");
+                    send_error(msg.session_id, "Cannot kick a user with equal or higher role",
+                               protocol::ServerErrorCode::PermissionDenied);
                     break;
                 }
-                send_error(s->id, "You have been kicked from the server");
+                send_error(s->id, "You have been kicked from the server",
+                           protocol::ServerErrorCode::Kicked);
                 quic_.disconnect(s->id);
             }
         }
@@ -1151,7 +1200,11 @@ void Server::handle_message(const IncomingMessage& msg) {
             std::string mime = reader.read_string();
             if (reader.error()) break;
 
-            // Generate disk path
+            // Generate disk path. NEVER derive it from the client filename:
+            // `fname` could contain path-traversal (`..\`, absolute paths) and
+            // escape the storage root. The on-disk name is fully server-
+            // controlled (msg_id + index + a sanitized extension); the original
+            // display name is preserved separately in the DB (`fname` below).
             auto t = std::time(nullptr);
             std::tm tm_buf{};
 #ifdef _MSC_VER
@@ -1161,8 +1214,17 @@ void Server::handle_message(const IncomingMessage& msg) {
 #endif
             char dir[16];
             std::strftime(dir, sizeof(dir), "%Y-%m", &tm_buf);
+            std::string ext;
+            if (auto dot = fname.find_last_of('.');
+                dot != std::string::npos && dot + 1 < fname.size()) {
+                for (char c : fname.substr(dot)) {  // keep the leading dot
+                    if (std::isalnum(static_cast<unsigned char>(c)) || c == '.')
+                        ext += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                    if (ext.size() >= 8) break;
+                }
+            }
             std::string disk_path = std::string(dir) + "/" +
-                std::to_string(msg_id) + "_" + std::to_string(i) + "_" + fname;
+                std::to_string(msg_id) + "_" + std::to_string(i) + ext;
 
             uint64_t att_id = db_.insert_attachment(msg_id, fname,
                 static_cast<int64_t>(fsize), mime, disk_path);
@@ -1420,31 +1482,29 @@ void Server::handle_message(const IncomingMessage& msg) {
     }
 }
 
-void Server::on_client_disconnect(uint32_t session_id) {
-	ZoneScopedN("Server::on_client_disconnect");
-    auto session = quic_.get_session(session_id);
-    if (session && session->authenticated && session->channel_id != 0) {
-        ChannelId ch = session->channel_id;
+void Server::process_disconnects() {
+	ZoneScopedN("Server::process_disconnects");
+    for (auto& d : quic_.disconnects().drain())
+        process_disconnect(d.session_id, d.user_id, d.channel_id);
+}
 
-        // Clean up screen share if this user was sharing
-        stop_screen_share(ch, session->user_id);
-        session->subscribed_sharer = 0;
+void Server::process_disconnect(uint32_t session_id, UserId user_id, ChannelId channel_id) {
+	ZoneScopedN("Server::process_disconnect");
+    if (channel_id == 0)
+        return;
 
-        // Mark session as no longer in channel (idempotent — prevents
-        // double broadcast if disconnect fires again from QUIC callback)
-        session->channel_id = 0;
-        session->authenticated = false;
+    // Clean up screen share if this user was sharing.
+    stop_screen_share(channel_id, user_id);
 
-        BinaryWriter writer;
-        writer.write_u32(session->user_id);
-        writer.write_u32(ch);
+    BinaryWriter writer;
+    writer.write_u32(user_id);
+    writer.write_u32(channel_id);
 
-        auto all = quic_.get_sessions();
-        for (auto& s : all) {
-            if (s->id != session_id && s->authenticated) {
-                quic_.send_to(s->id, protocol::ControlMessageType::USER_LEFT_CHANNEL,
-                               writer.data().data(), writer.data().size());
-            }
+    auto all = quic_.get_sessions();
+    for (auto& s : all) {
+        if (s->id != session_id && s->authenticated) {
+            quic_.send_to(s->id, protocol::ControlMessageType::USER_LEFT_CHANNEL,
+                           writer.data().data(), writer.data().size());
         }
     }
 }
@@ -1591,24 +1651,6 @@ void Server::stop_screen_share(ChannelId channel_id, UserId user_id) {
     }
 
     LOG_INFO("User {} stopped screen sharing in channel {}", user_id, channel_id);
-}
-
-void Server::send_channel_key(uint32_t session_id, ChannelId channel_id) {
-	ZoneScopedN("Server::send_channel_key");
-    auto it = channel_keys_.find(channel_id);
-    if (it == channel_keys_.end()) {
-        std::array<uint8_t, 32> key;
-        parties::random_bytes(key.data(), key.size());
-        channel_keys_[channel_id] = key;
-        it = channel_keys_.find(channel_id);
-        LOG_INFO("Generated encryption key for channel {}", channel_id);
-    }
-
-    BinaryWriter writer;
-    writer.write_u32(channel_id);
-    writer.write_bytes(it->second.data(), 32);
-    quic_.send_to(session_id, protocol::ControlMessageType::CHANNEL_KEY,
-                 writer.data().data(), writer.data().size());
 }
 
 } // namespace parties::server

@@ -45,6 +45,15 @@ struct FileDownloadRequest {
     HQUIC stream;  // Send file data back on this stream
 };
 
+// A session that dropped. Captured (under sessions_mutex_) on the MsQuic worker
+// thread at SHUTDOWN_COMPLETE and drained on the server main loop, so all
+// Session-field reads/writes for disconnect handling stay on one thread.
+struct SessionDisconnect {
+    uint32_t  session_id;
+    UserId    user_id;
+    ChannelId channel_id;   // 0 if the session wasn't in a channel
+};
+
 class QuicServer {
 public:
     QuicServer();
@@ -84,8 +93,10 @@ public:
     // the values are read from the MsQuic listener thread.
     void set_server_info(std::string name, uint16_t max_users, bool password_locked);
 
-    // Callback for when a session disconnects
-    std::function<void(uint32_t session_id)> on_disconnect;
+    // Queue of dropped sessions (drained on the server main loop). Replaces the
+    // old on_disconnect callback, which ran Session mutation on the worker
+    // thread and raced the main loop.
+    ThreadQueue<SessionDisconnect>& disconnects() { return disconnects_; }
 
     // Callback for video frames — called directly from QUIC receive thread
     // to bypass the polling loop and avoid 1ms+ latency.
@@ -185,6 +196,7 @@ private:
     ThreadQueue<DataPacket> data_incoming_;
     ThreadQueue<FileUploadEvent> file_uploads_;
     ThreadQueue<FileDownloadRequest> file_downloads_;
+    ThreadQueue<SessionDisconnect> disconnects_;
 };
 
 } // namespace parties::server

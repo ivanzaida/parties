@@ -106,7 +106,7 @@ static bool wait_for_message_collecting(
 }
 
 // Find a message of given type in a collected side_msgs vector
-static bool find_side_message(
+[[maybe_unused]] static bool find_side_message(
     const std::vector<std::pair<ControlMessageType, std::vector<uint8_t>>>& msgs,
     ControlMessageType type, std::vector<uint8_t>& payload)
 {
@@ -354,14 +354,6 @@ int main() {
         TEST_ASSERT(wait_for_message_collecting(client_a, ControlMessageType::CHANNEL_USER_LIST,
                     payload, side), "client A channel user list");
 
-        // CHANNEL_KEY arrives too — just verify it was received
-        std::vector<uint8_t> key_payload;
-        if (!find_side_message(side, ControlMessageType::CHANNEL_KEY, key_payload)) {
-            TEST_ASSERT(wait_for_message(client_a, ControlMessageType::CHANNEL_KEY, key_payload),
-                        "client A channel key");
-        }
-        TEST_ASSERT(key_payload.size() >= 36, "channel key payload size");
-
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         drain_messages(client_a);
     }
@@ -377,13 +369,6 @@ int main() {
         std::vector<std::pair<ControlMessageType, std::vector<uint8_t>>> side;
         TEST_ASSERT(wait_for_message_collecting(client_b, ControlMessageType::CHANNEL_USER_LIST,
                     payload, side), "client B channel user list");
-
-        // CHANNEL_KEY arrives too — verify it was received
-        std::vector<uint8_t> key_payload;
-        if (!find_side_message(side, ControlMessageType::CHANNEL_KEY, key_payload)) {
-            TEST_ASSERT(wait_for_message(client_b, ControlMessageType::CHANNEL_KEY, key_payload),
-                        "client B channel key");
-        }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         drain_messages(client_b);

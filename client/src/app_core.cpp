@@ -667,7 +667,6 @@ void AppCore::on_disconnect_cleanup()
 
     authenticated_ = false;
     current_channel_ = 0;
-    channel_key_ = {};
     server_password_.clear();
     viewing_sharer_ = 0;
     awaiting_keyframe_ = false;
@@ -895,7 +894,6 @@ void AppCore::leave_channel()
     }
 
     current_channel_ = 0;
-    channel_key_ = {};
 
     if (bridge_.play_sound)
         bridge_.play_sound(SoundPlayer::Effect::LeaveChannel);
@@ -1007,8 +1005,6 @@ void AppCore::handle_server_message(protocol::ControlMessageType type,
         on_user_voice_state(data, len); break;
     case protocol::ControlMessageType::USER_ROLE_CHANGED:
         on_user_role_changed(data, len); break;
-    case protocol::ControlMessageType::CHANNEL_KEY:
-        on_channel_key(data, len); break;
     case protocol::ControlMessageType::SCREEN_SHARE_STARTED:
         on_screen_share_started(data, len); break;
     case protocol::ControlMessageType::SCREEN_SHARE_STOPPED:
@@ -1340,15 +1336,6 @@ void AppCore::on_user_role_changed(const uint8_t* data, size_t len)
     model_.channels.notify();
 }
 
-void AppCore::on_channel_key(const uint8_t* data, size_t len)
-{
-    BinaryReader reader(data, len);
-    ChannelId ch_id = reader.read_u32();
-    (void)ch_id;
-    if (reader.remaining() < 32 || reader.error()) return;
-    reader.read_bytes(channel_key_.data(), 32);
-}
-
 void AppCore::on_screen_share_started(const uint8_t* data, size_t len)
 {
     BinaryReader reader(data, len);
@@ -1428,17 +1415,19 @@ void AppCore::on_admin_result(const uint8_t* data, size_t len)
 void AppCore::on_server_error(const uint8_t* data, size_t len)
 {
     BinaryReader reader(data, len);
+    uint16_t code_raw = reader.read_u16();
     std::string msg = reader.read_string();
     if (reader.error()) return;
+    auto code = static_cast<protocol::ServerErrorCode>(code_raw);
 
-    LOG_ERROR("Server error: {}", msg);
+    LOG_ERROR("Server error [{}]: {}", code_raw, msg);
 
     // Terminal, server-initiated disconnects (admin kick, or being replaced by
     // a login from elsewhere) arrive as an error immediately followed by a
     // transport drop. Mark the upcoming drop intentional so we don't fight it.
     if (authenticated_ &&
-        (msg.find("kicked") != std::string::npos ||
-         msg.find("another location") != std::string::npos)) {
+        (code == protocol::ServerErrorCode::Kicked ||
+         code == protocol::ServerErrorCode::Replaced)) {
         intentional_disconnect_ = true;
         if (bridge_.play_sound)
             bridge_.play_sound(SoundPlayer::Effect::ServerDisconnected);
