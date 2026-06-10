@@ -37,6 +37,12 @@ public:
     // is_keyframe = true for IDR frames (prepended with SPS/PPS).
     std::function<void(const uint8_t* data, size_t len, bool is_keyframe)> on_encoded;
 
+    // The codec actually in use after init(). May differ from the requested
+    // codec: Apple Silicon has no AV1 encoder, so AV1 falls back to H265.
+    // Callers must read this (not the requested codec) when tagging the wire
+    // format, or the receiver will try to decode with the wrong codec.
+    MacVideoCodec actual_codec() const { return codec_; }
+
 private:
     static void compress_callback(void*                refcon,
                                   void*                frameRefcon,
@@ -50,6 +56,7 @@ private:
     MacVideoCodec           codec_   = MacVideoCodec::H264;
     uint32_t                width_   = 0;
     uint32_t                height_  = 0;
+    uint32_t                fps_     = 30;
     int64_t                 pts_     = 0;
     std::mutex              mutex_;
 };

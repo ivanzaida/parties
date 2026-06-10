@@ -14,6 +14,7 @@
 
 // RmlUi Metal backend
 #import "../metal/RmlUi_Backend_macOS_Metal.h"
+#import "../metal/RmlUi_Renderer_Metal.h"
 
 // RmlUi core
 #include <RmlUi/Core/Core.h>
@@ -46,6 +47,7 @@
 #include <client/level_meter_element.h>
 #include <client/gradient_circle_element.h>
 #include <client/custom_elements.h>
+#include <client/slug_font_engine.h>
 
 #ifdef SENTRY_COCOA_ENABLED
 #import <Sentry/Sentry.h>
@@ -71,6 +73,10 @@ extern void macos_updater_check_in_background();
 using namespace parties;
 using namespace parties::client;
 using namespace parties::protocol;
+
+// Slug GPU font engine — owned for the app lifetime (mirrors Windows ui_manager).
+// Must outlive RmlUi, which holds a raw FontEngineInterface pointer to it.
+static std::unique_ptr<SlugFontEngine> g_slug_font_engine;
 
 // ── Key mapping — NSEvent key codes → RmlUi ──────────────────────────────────
 
@@ -312,6 +318,14 @@ static int macos_modifiers_to_rml(NSEventModifierFlags flags)
     Rml::SetFileInterface(&_fileInterface);
     Rml::SetSystemInterface(Backend::GetSystemInterface());
     Rml::SetRenderInterface(Backend::GetRenderInterface());
+
+    // ── Slug GPU font engine ──────────────────────────────────────────────
+    // Replaces FreeType: glyphs render as GPU-evaluated Bezier coverage.
+    // Wire it to the Metal renderer (for curve/band textures + batch data) and
+    // install it as RmlUi's font engine. Both must happen before Rml::Initialise().
+    g_slug_font_engine = std::make_unique<SlugFontEngine>();
+    Backend::GetMetalRenderInterface()->SetSlugFontEngine(g_slug_font_engine.get());
+    Rml::SetFontEngineInterface(g_slug_font_engine.get());
 
     Rml::Initialise();
 
@@ -663,6 +677,22 @@ static int macos_modifiers_to_rml(NSEventModifierFlags flags)
             float sf = scale_factors[scale_idx];
             uint32_t enc_w = ((uint32_t)(w * sf) + 1) & ~1u;
             uint32_t enc_h = ((uint32_t)(h * sf) + 1) & ~1u;
+
+            // Cap the encoded long edge. ScreenCaptureKit hands us full 2x Retina
+            // pixels (a 14"/16" MacBook captures at ~3024-3456 wide, external 5K
+            // displays far more), so at "Source" scale the bitrate is spread over
+            // ~4x the pixels of a comparable 1080p Windows capture — the dominant
+            // cause of the blocky, "low-bitrate at 20 Mb/s" look. 1920 on the long
+            // edge is the screen-share sweet spot: crisp text, great bits/pixel.
+            // Users wanting lower res still get it via the scale_factors above.
+            static const uint32_t kMaxEncodeLongEdge = 1920;
+            uint32_t long_edge = std::max(enc_w, enc_h);
+            if (long_edge > kMaxEncodeLongEdge) {
+                float r = (float)kMaxEncodeLongEdge / (float)long_edge;
+                enc_w = ((uint32_t)(enc_w * r) + 1) & ~1u;
+                enc_h = ((uint32_t)(enc_h * r) + 1) & ~1u;
+            }
+
             if (enc_w < 64) enc_w = 64;
             if (enc_h < 64) enc_h = 64;
             bself->_encodeWidth  = enc_w;
@@ -674,8 +704,13 @@ static int macos_modifiers_to_rml(NSEventModifierFlags flags)
             }
             bself->_encoderReady = true;
 
-            VideoCodecId wire_codec = (mac_codec == MacVideoCodec::AV1)  ? VideoCodecId::AV1
-                                   : (mac_codec == MacVideoCodec::H264) ? VideoCodecId::H264
+            // Use the codec the encoder actually initialized with, not the
+            // requested one: AV1 falls back to H265 on Apple Silicon (no AV1
+            // encoder). Tagging the wire with the real codec keeps receivers
+            // from decoding HEVC frames as AV1.
+            MacVideoCodec eff_codec = bself->_encoder->actual_codec();
+            VideoCodecId wire_codec = (eff_codec == MacVideoCodec::AV1)  ? VideoCodecId::AV1
+                                   : (eff_codec == MacVideoCodec::H264) ? VideoCodecId::H264
                                                                         : VideoCodecId::H265;
             bself->_encoder->on_encoded = [bself, wire_codec](const uint8_t* data, size_t len, bool is_kf) {
                 if (!bself->_core.authenticated_) return;
@@ -733,7 +768,12 @@ static int macos_modifiers_to_rml(NSEventModifierFlags flags)
             CIImage* scaled = [srcImage imageByApplyingTransform:CGAffineTransformMakeScale(sx, sy)];
 
             if (!bself->_ciContext)
-                bself->_ciContext = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
+                // -retain: this target is MRR (no ARC). contextWithOptions:
+                // returns an autoreleased object; without retaining it the ivar
+                // dangles after the capture queue's autorelease pool drains and
+                // the next frame crashes ("-[IOSurface render:toCVPixelBuffer:]:
+                // unrecognized selector"). One context is created and reused.
+                bself->_ciContext = [[CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}] retain];
 
             CVPixelBufferRef scaledBuf = nullptr;
             NSDictionary* attrs = @{
@@ -873,6 +913,7 @@ static int macos_modifiers_to_rml(NSEventModifierFlags flags)
 {
     _core.shutdown();
     _soundPlayer.shutdown();
+    if (_ciContext) { [_ciContext release]; _ciContext = nil; }  // MRR: balance the retain in onCaptureStarted
 }
 
 @end
@@ -1019,6 +1060,9 @@ static int macos_modifiers_to_rml(NSEventModifierFlags flags)
 {
     [_viewController shutdown];
     Rml::Shutdown();
+    // Safe to destroy the font engine now: Rml::Shutdown() has released all
+    // references to the FontEngineInterface.
+    g_slug_font_engine.reset();
     Backend::Shutdown();
     parties::quic_cleanup();
 }

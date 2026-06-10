@@ -8,6 +8,8 @@
 #include <RmlUi/Core/SystemInterface.h>
 #include <RmlUi/Core/Types.h>
 
+class RenderInterface_Metal;
+
 /**
  * macOS + Metal backend for RmlUi.
  *
@@ -35,6 +37,9 @@ void Shutdown();
 
 Rml::SystemInterface* GetSystemInterface();
 Rml::RenderInterface* GetRenderInterface();
+
+/// Concrete Metal render interface (for wiring the Slug font engine).
+RenderInterface_Metal* GetMetalRenderInterface();
 
 void SetViewport(int width, int height);
 

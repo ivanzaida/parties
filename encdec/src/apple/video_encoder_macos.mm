@@ -95,6 +95,7 @@ bool VideoEncoderMac::init(MacVideoCodec codec, uint32_t width, uint32_t height,
     codec_  = codec;
     width_  = width;
     height_ = height;
+    fps_    = fps > 0 ? fps : 30;
     pts_    = 0;
 
     CMVideoCodecType vt_codec;
@@ -144,6 +145,29 @@ bool VideoEncoderMac::init(MacVideoCodec codec, uint32_t width, uint32_t height,
         this,
         &session_);
 
+    // Apple Silicon (through M4) has no AV1 hardware encoder and VideoToolbox
+    // ships no software one, so an AV1 compression session fails with
+    // kVTCouldNotFindVideoEncoderErr (-12908). Fall back to HEVC, which every
+    // Apple Silicon GPU encodes in hardware. codec_ is updated so the emitted
+    // NAL parsing (handle_encoded_sample) and the wire codec (actual_codec(),
+    // read by the caller) match what we actually produce.
+    if (status != noErr && codec == MacVideoCodec::AV1) {
+        fprintf(stderr, "[VideoEncoderMac] AV1 encode unavailable (%d); falling back to HEVC\n",
+                (int)status);
+        codec_   = MacVideoCodec::H265;
+        vt_codec = kCMVideoCodecType_HEVC;
+        status = VTCompressionSessionCreate(
+            kCFAllocatorDefault,
+            (int32_t)width, (int32_t)height,
+            vt_codec,
+            props,
+            pb_attrs,
+            nullptr,
+            compress_callback,
+            this,
+            &session_);
+    }
+
     CFRelease(props);
     CFRelease(pb_attrs);
 
@@ -161,9 +185,13 @@ bool VideoEncoderMac::init(MacVideoCodec codec, uint32_t width, uint32_t height,
                          bps_num);
     CFRelease(bps_num);
 
-    // Hard data rate limit: allow 1.5x the target over a 1-second window.
+    // Hard data rate limit: allow 2x the target over a 1-second window.
     // Without this, AverageBitRate is just a soft hint that VT freely exceeds.
-    int32_t byte_limit = (int32_t)(bitrate_bps * 1.5 / 8);
+    // The window is real-time only because we now feed real host-clock PTS
+    // (see encode()); with the old 1000-tick "1ms per frame" PTS this window
+    // spanned ~1000 frames and never bound. 2x (vs 1.5x) lets keyframes and
+    // scene changes spend enough bits to avoid the blocky "low-bitrate" look.
+    int32_t byte_limit = (int32_t)(bitrate_bps * 2.0 / 8);
     int32_t time_limit = 1; // seconds
     CFNumberRef limit_bytes = CFNumberCreate(nullptr, kCFNumberSInt32Type, &byte_limit);
     CFNumberRef limit_time  = CFNumberCreate(nullptr, kCFNumberSInt32Type, &time_limit);
@@ -197,21 +225,45 @@ bool VideoEncoderMac::init(MacVideoCodec codec, uint32_t width, uint32_t height,
                          kVTCompressionPropertyKey_RealTime,
                          kCFBooleanTrue);
 
-    // Profile / level (H264: Baseline, H265: Main)
+    // Profile / level (H264: High, H265: Main)
     if (codec == MacVideoCodec::H264) {
         VTSessionSetProperty(session_,
                              kVTCompressionPropertyKey_ProfileLevel,
                              kVTProfileLevel_H264_High_AutoLevel);
+        // High profile supports CABAC — set it explicitly for ~10% better
+        // compression efficiency than CAVLC at the same bitrate.
+        VTSessionSetProperty(session_,
+                             kVTCompressionPropertyKey_H264EntropyMode,
+                             kVTH264EntropyMode_CABAC);
     } else {
         VTSessionSetProperty(session_,
                              kVTCompressionPropertyKey_ProfileLevel,
                              kVTProfileLevel_HEVC_Main_AutoLevel);
     }
 
+    // Low-latency: no B-frames / reordering. RealTime already implies this,
+    // but set it explicitly so the decoder never waits on out-of-order frames.
+    VTSessionSetProperty(session_,
+                         kVTCompressionPropertyKey_AllowFrameReordering,
+                         kCFBooleanFalse);
+
+    // Colour signalling (BT.709). The source is sRGB BGRA; without tagging the
+    // bitstream the decoder guesses the matrix/range and colours come out
+    // washed or over-saturated — a big part of the "looks bad" report. We tag
+    // 709 (the HD standard) so VideoToolbox uses the 709 RGB→YCbCr matrix on
+    // encode and the receiver inverts it correctly.
+    VTSessionSetProperty(session_, kVTCompressionPropertyKey_ColorPrimaries,
+                         kCVImageBufferColorPrimaries_ITU_R_709_2);
+    VTSessionSetProperty(session_, kVTCompressionPropertyKey_TransferFunction,
+                         kCVImageBufferTransferFunction_ITU_R_709_2);
+    VTSessionSetProperty(session_, kVTCompressionPropertyKey_YCbCrMatrix,
+                         kCVImageBufferYCbCrMatrix_ITU_R_709_2);
+
     VTCompressionSessionPrepareToEncodeFrames(session_);
+    const char* codec_name = codec_ == MacVideoCodec::AV1  ? "AV1"
+                           : codec_ == MacVideoCodec::H265 ? "H265" : "H264";
     fprintf(stderr, "[VideoEncoderMac] Initialized %s %ux%u @ %u bps %u fps\n",
-            codec == MacVideoCodec::H265 ? "H265" : "H264",
-            width, height, bitrate_bps, fps);
+            codec_name, width, height, bitrate_bps, fps);
     return true;
 }
 
@@ -230,7 +282,15 @@ void VideoEncoderMac::encode(CVPixelBufferRef pixel_buffer, bool force_keyframe)
     std::lock_guard lock(mutex_);
     if (!session_ || !pixel_buffer) return;
 
-    CMTime pts = CMTimeMake(pts_++, 1000);  // millisecond timebase
+    // Real-time presentation timestamp from the host clock. The previous scheme
+    // (pts_++ at a 1000-tick timebase) advanced PTS by exactly 1 ms per frame,
+    // telling VideoToolbox the stream ran at ~1000 fps regardless of the real
+    // rate. That mismatch with ExpectedFrameRate corrupted rate-control pacing
+    // and made the DataRateLimits window meaningless. Host-clock PTS gives VT
+    // accurate inter-frame timing so it allocates bits per real second.
+    CMTime pts = CMClockGetTime(CMClockGetHostTimeClock());
+    CMTime dur = fps_ > 0 ? CMTimeMake(1, (int32_t)fps_) : kCMTimeInvalid;
+    pts_++;  // retained only for diagnostics
 
     CFMutableDictionaryRef frame_props = nullptr;
     if (force_keyframe) {
@@ -246,7 +306,7 @@ void VideoEncoderMac::encode(CVPixelBufferRef pixel_buffer, bool force_keyframe)
     VTEncodeInfoFlags info = 0;
     VTCompressionSessionEncodeFrame(
         session_, pixel_buffer,
-        pts, kCMTimeInvalid,
+        pts, dur,
         frame_props, nullptr, &info);
 
     if (frame_props) CFRelease(frame_props);

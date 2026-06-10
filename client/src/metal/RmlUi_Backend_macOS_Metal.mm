@@ -40,6 +40,12 @@ Rml::RenderInterface* Backend::GetRenderInterface()
     return g_data->render_interface;
 }
 
+RenderInterface_Metal* Backend::GetMetalRenderInterface()
+{
+    RMLUI_ASSERT(g_data);
+    return g_data->render_interface;
+}
+
 void Backend::SetViewport(int width, int height)
 {
     RMLUI_ASSERT(g_data);
