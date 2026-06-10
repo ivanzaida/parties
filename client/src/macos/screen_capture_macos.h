@@ -26,7 +26,12 @@ public:
     // Show the system SCContentSharingPicker (macOS 14+) and start capturing.
     // Falls back to capturing the main display on macOS 12-13.
     // Calls on_started(true) on success, on_started(false) if user cancels or error.
-    void pick_and_start(uint32_t target_fps,
+    //
+    // output_scale (0..1] scales the captured frame on the GPU inside
+    // ScreenCaptureKit, and the long edge is additionally capped (see the .mm)
+    // so the encoder receives sensibly-sized, even-dimensioned frames. This
+    // replaces per-frame CPU/Core Image downscaling.
+    void pick_and_start(uint32_t target_fps, float output_scale,
                         std::function<void(bool success)> on_started);
     void stop();
 

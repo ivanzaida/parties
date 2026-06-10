@@ -267,8 +267,6 @@ static int macos_modifiers_to_rml(NSEventModifierFlags flags)
     bool                              _needsKeyframe;
     uint32_t                          _encodeWidth;
     uint32_t                          _encodeHeight;
-    bool                              _needsScale;
-    CIContext*                        _ciContext;
 
     // Stream audio — Opus encoder for screen share audio
     parties::OpusCodec                _streamAudioEncoder;
@@ -361,8 +359,6 @@ static int macos_modifiers_to_rml(NSEventModifierFlags flags)
     _needsKeyframe   = false;
     _encodeWidth     = 0;
     _encodeHeight    = 0;
-    _needsScale      = false;
-    _ciContext       = nil;
 
     _soundPlayer.init();
 
@@ -642,7 +638,12 @@ static int macos_modifiers_to_rml(NSEventModifierFlags flags)
     static const uint32_t fps_table[] = { 15, 30, 60, 120 };
     uint32_t capture_fps = fps_table[std::min(_core.model_.share_fps.get(), 3)];
 
-    _capturer->pick_and_start(capture_fps, [bself](bool success) {
+    // User scale (0=Source, 1=x0.75, 2=x0.5, 3=x0.25). ScreenCaptureKit applies
+    // this (and a long-edge cap) on the GPU, so frames arrive at encode size.
+    static const float scale_factors[] = {1.0f, 0.75f, 0.5f, 0.25f};
+    float output_scale = scale_factors[std::max(0, std::min(_core.model_.share_scale.get(), 3))];
+
+    _capturer->pick_and_start(capture_fps, output_scale, [bself](bool success) {
         NSLog(@"[ScreenShare] pick_and_start callback: success=%d", success);
         dispatch_async(dispatch_get_main_queue(), ^{
             if (!success) { NSLog(@"[ScreenShare] capture failed, resetting"); bself->_capturer.reset(); return; }
@@ -671,33 +672,16 @@ static int macos_modifiers_to_rml(NSEventModifierFlags flags)
                                     : (bself->_core.model_.share_codec == 2) ? MacVideoCodec::H264
                                                                              : MacVideoCodec::H265;
 
-            // Apply scale factor
-            static const float scale_factors[] = {1.0f, 0.75f, 0.5f, 0.25f};
-            int scale_idx = std::max(0, std::min(bself->_core.model_.share_scale.get(), 3));
-            float sf = scale_factors[scale_idx];
-            uint32_t enc_w = ((uint32_t)(w * sf) + 1) & ~1u;
-            uint32_t enc_h = ((uint32_t)(h * sf) + 1) & ~1u;
-
-            // Cap the encoded long edge. ScreenCaptureKit hands us full 2x Retina
-            // pixels (a 14"/16" MacBook captures at ~3024-3456 wide, external 5K
-            // displays far more), so at "Source" scale the bitrate is spread over
-            // ~4x the pixels of a comparable 1080p Windows capture — the dominant
-            // cause of the blocky, "low-bitrate at 20 Mb/s" look. 1920 on the long
-            // edge is the screen-share sweet spot: crisp text, great bits/pixel.
-            // Users wanting lower res still get it via the scale_factors above.
-            static const uint32_t kMaxEncodeLongEdge = 1920;
-            uint32_t long_edge = std::max(enc_w, enc_h);
-            if (long_edge > kMaxEncodeLongEdge) {
-                float r = (float)kMaxEncodeLongEdge / (float)long_edge;
-                enc_w = ((uint32_t)(enc_w * r) + 1) & ~1u;
-                enc_h = ((uint32_t)(enc_h * r) + 1) & ~1u;
-            }
-
+            // Frames already arrive at the final encode size: ScreenCaptureKit
+            // applies the user scale + long-edge cap on the GPU (see
+            // pick_and_start). Encode the buffer as-is — no CPU downscale. Even
+            // dimensions are guaranteed by the capture config.
+            uint32_t enc_w = w & ~1u;
+            uint32_t enc_h = h & ~1u;
             if (enc_w < 64) enc_w = 64;
             if (enc_h < 64) enc_h = 64;
             bself->_encodeWidth  = enc_w;
             bself->_encodeHeight = enc_h;
-            bself->_needsScale   = (enc_w != w || enc_h != h);
 
             if (!bself->_encoder->init(mac_codec, enc_w, enc_h, bitrate, fps)) {
                 bself->_encoder.reset(); return;
@@ -760,38 +744,9 @@ static int macos_modifiers_to_rml(NSEventModifierFlags flags)
         bool forceKF = bself->_needsKeyframe;
         bself->_needsKeyframe = false;
 
-        if (bself->_needsScale) {
-            // GPU-accelerated downscale via Core Image
-            CIImage* srcImage = [CIImage imageWithCVPixelBuffer:buf];
-            float sx = (float)bself->_encodeWidth  / (float)w;
-            float sy = (float)bself->_encodeHeight / (float)h;
-            CIImage* scaled = [srcImage imageByApplyingTransform:CGAffineTransformMakeScale(sx, sy)];
-
-            if (!bself->_ciContext)
-                // -retain: this target is MRR (no ARC). contextWithOptions:
-                // returns an autoreleased object; without retaining it the ivar
-                // dangles after the capture queue's autorelease pool drains and
-                // the next frame crashes ("-[IOSurface render:toCVPixelBuffer:]:
-                // unrecognized selector"). One context is created and reused.
-                bself->_ciContext = [[CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}] retain];
-
-            CVPixelBufferRef scaledBuf = nullptr;
-            NSDictionary* attrs = @{
-                (id)kCVPixelBufferWidthKey:  @(bself->_encodeWidth),
-                (id)kCVPixelBufferHeightKey: @(bself->_encodeHeight),
-                (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
-                (id)kCVPixelBufferIOSurfacePropertiesKey: @{}
-            };
-            CVPixelBufferCreate(kCFAllocatorDefault, bself->_encodeWidth, bself->_encodeHeight,
-                                kCVPixelFormatType_32BGRA, (__bridge CFDictionaryRef)attrs, &scaledBuf);
-            if (scaledBuf) {
-                [bself->_ciContext render:scaled toCVPixelBuffer:scaledBuf];
-                bself->_encoder->encode(scaledBuf, forceKF);
-                CVPixelBufferRelease(scaledBuf);
-            }
-        } else {
-            bself->_encoder->encode(buf, forceKF);
-        }
+        // Frame is already at encode resolution (scaled on the GPU by
+        // ScreenCaptureKit). Encode it directly — no per-frame Core Image pass.
+        bself->_encoder->encode(buf, forceKF);
     };
 
     // Stream audio: init Opus encoder and accumulation buffer (48 kHz, stereo, 20 ms frames)
@@ -913,7 +868,6 @@ static int macos_modifiers_to_rml(NSEventModifierFlags flags)
 {
     _core.shutdown();
     _soundPlayer.shutdown();
-    if (_ciContext) { [_ciContext release]; _ciContext = nil; }  // MRR: balance the retain in onCaptureStarted
 }
 
 @end

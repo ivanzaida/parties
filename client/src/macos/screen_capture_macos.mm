@@ -154,6 +154,7 @@ struct ScreenCaptureMac::Impl {
     // Nested class has implicit access to ScreenCaptureMac private members (C++11).
     static void start_with_filter(ScreenCaptureMac* cap, Impl* impl,
                                   SCContentFilter* filter, uint32_t target_fps,
+                                  float output_scale,
                                   std::function<void(bool)> on_started);
 };
 
@@ -188,9 +189,10 @@ void ScreenCaptureMac::Impl::start_with_filter(ScreenCaptureMac* cap,
                                                 Impl* impl,
                                                 SCContentFilter* filter,
                                                 uint32_t target_fps,
+                                                float output_scale,
                                                 std::function<void(bool)> on_started)
 {
-    NSLog(@"[ScreenCaptureMac] start_with_filter: fps=%u", target_fps);
+    NSLog(@"[ScreenCaptureMac] start_with_filter: fps=%u scale=%.2f", target_fps, output_scale);
 
     // Wire callbacks into the delegate.
     impl->output.onFrame = [cap](CVPixelBufferRef buf, uint32_t w, uint32_t h) {
@@ -220,14 +222,42 @@ void ScreenCaptureMac::Impl::start_with_filter(ScreenCaptureMac* cap,
     cfg.sampleRate                   = 48000;
     cfg.channelCount                 = 2;
 
-    // Capture at full Retina pixel resolution (2x on HiDPI).
-    // Without this, SCK defaults to point dimensions (half res on Retina).
-    CGSize source_size = filter.contentRect.size;
-    CGFloat scale      = filter.pointPixelScale;
-    cfg.width  = (NSUInteger)(source_size.width  * scale);
-    cfg.height = (NSUInteger)(source_size.height * scale);
-    NSLog(@"[ScreenCaptureMac] capture resolution: %lux%lu (scale=%.1f)",
-          (unsigned long)cfg.width, (unsigned long)cfg.height, scale);
+    // Determine the output resolution. ScreenCaptureKit scales the captured
+    // content to cfg.width/height on the GPU, so we ask it to deliver frames at
+    // exactly the size we encode — no per-frame CPU/Core Image downscale.
+    //
+    //   full Retina pixels  ->  * output_scale (user setting)  ->  cap long edge
+    //
+    // The long-edge cap keeps the bitrate from being spread over full 2x Retina
+    // pixels (a 14"/16" MacBook captures ~3000-3500 px wide), which was the main
+    // "looks like low bitrate" cause. Dimensions are rounded to even (H.264/HEVC
+    // require it). The encoder is initialized from the delivered frame size.
+    static const double kMaxLongEdge = 1920.0;
+    double os = (output_scale > 0.0f && output_scale <= 1.0f) ? output_scale : 1.0;
+    if (@available(macOS 14.0, *)) {
+        CGSize  source_size = filter.contentRect.size;     // points
+        CGFloat px_scale    = filter.pointPixelScale;      // 2.0 on Retina
+        double out_w = source_size.width  * px_scale * os;
+        double out_h = source_size.height * px_scale * os;
+        double long_edge = out_w > out_h ? out_w : out_h;
+        if (long_edge > kMaxLongEdge) {
+            double r = kMaxLongEdge / long_edge;
+            out_w *= r;
+            out_h *= r;
+        }
+        NSUInteger ew = ((NSUInteger)(out_w + 0.5)) & ~(NSUInteger)1;
+        NSUInteger eh = ((NSUInteger)(out_h + 0.5)) & ~(NSUInteger)1;
+        if (ew < 64) ew = 64;
+        if (eh < 64) eh = 64;
+        cfg.width  = ew;
+        cfg.height = eh;
+        NSLog(@"[ScreenCaptureMac] output resolution: %lux%lu (source=%.0fx%.0f pxscale=%.1f userscale=%.2f)",
+              (unsigned long)cfg.width, (unsigned long)cfg.height,
+              source_size.width * px_scale, source_size.height * px_scale, px_scale, os);
+    }
+    // macOS 12-13: contentRect/pointPixelScale are unavailable, so SCK uses its
+    // default output size (point resolution); the encoder adapts to whatever
+    // frame size is delivered.
 
     SCStream* stream = [[SCStream alloc] initWithFilter:filter
                                           configuration:cfg
@@ -271,7 +301,7 @@ void ScreenCaptureMac::Impl::start_with_filter(ScreenCaptureMac* cap,
 
 // ── pick_and_start ───────────────────────────────────────────────────────────
 
-void ScreenCaptureMac::pick_and_start(uint32_t target_fps,
+void ScreenCaptureMac::pick_and_start(uint32_t target_fps, float output_scale,
                                        std::function<void(bool)> on_started)
 {
     if (capturing_) stop();
@@ -300,7 +330,7 @@ void ScreenCaptureMac::pick_and_start(uint32_t target_fps,
             cap->impl_->observer = nil;
             picker.active = NO;
 
-            Impl::start_with_filter(cap, cap->impl_, filter, target_fps, on_started);
+            Impl::start_with_filter(cap, cap->impl_, filter, target_fps, output_scale, on_started);
         };
 
         observer.onCancelled = ^{
@@ -332,7 +362,7 @@ void ScreenCaptureMac::pick_and_start(uint32_t target_fps,
                 SCContentFilter* filter = [[SCContentFilter alloc]
                     initWithDisplay:mainDisplay excludingWindows:@[]];
 
-                Impl::start_with_filter(cap, cap->impl_, filter, target_fps, on_started);
+                Impl::start_with_filter(cap, cap->impl_, filter, target_fps, output_scale, on_started);
             }];
     }
 }
