@@ -23,3 +23,7 @@ default_bitrate = 32000
 
 [logging]
 level = "info"
+
+[plugins]
+enabled = false
+directory = "plugins"

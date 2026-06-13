@@ -16,6 +16,11 @@ struct ChatConfig {
     int         message_retention_days = 0;                    // 0 = keep forever
 };
 
+struct PluginConfig {
+    bool        enabled   = false;
+    std::string directory = "plugins";
+};
+
 struct Config {
     std::string server_name    = "Parties Server";
     std::string listen_ip      = "0.0.0.0";
@@ -37,6 +42,7 @@ struct Config {
     std::string log_level      = "info";
 
     ChatConfig  chat;
+    PluginConfig plugins;
 
     static Config load(const std::string& toml_path);
 };

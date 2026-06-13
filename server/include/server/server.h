@@ -3,6 +3,7 @@
 #include <server/config.h>
 #include <server/quic_server.h>
 #include <server/database.h>
+#include <server/plugin_manager.h>
 #include <parties/types.h>
 #include <parties/video_common.h>
 
@@ -42,6 +43,7 @@ private:
                     protocol::ServerErrorCode code = protocol::ServerErrorCode::Generic);
     void send_channel_list(uint32_t session_id);
     void send_text_channel_list(uint32_t session_id);
+    void send_chat_command_list(uint32_t session_id);
 
     // Screen sharing
     void forward_video_frame(uint32_t session_id, const uint8_t* data, size_t len);
@@ -52,6 +54,7 @@ private:
     Config config_;
     Database db_;
     QuicServer quic_;
+    PluginManager plugins_;
     std::atomic<bool> running_{false};
 
     // Screen share state: channel_id -> set of sharer user_ids

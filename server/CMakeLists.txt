@@ -6,6 +6,7 @@ set_target_properties(toml11::toml11 PROPERTIES INTERFACE_COMPILE_OPTIONS "")
 add_executable(parties_server
     src/main.cpp
     src/config.cpp
+    src/plugin_manager.cpp
     src/quic_server.cpp
     src/database.cpp
     src/server.cpp
@@ -21,6 +22,7 @@ target_link_libraries(parties_server
         parties_common
         unofficial::sqlite3::sqlite3
         toml11::toml11
+        ${CMAKE_DL_LIBS}
 )
 
 if(WIN32)

@@ -90,6 +90,12 @@ Config Config::load(const std::string& toml_path) {
                 cfg.chat.file_storage_path      = toml::find_or(c, "file_storage_path", cfg.chat.file_storage_path);
                 cfg.chat.message_retention_days = toml::find_or(c, "message_retention_days", cfg.chat.message_retention_days);
             }
+
+            if (data.contains("plugins")) {
+                auto& p = data.at("plugins");
+                cfg.plugins.enabled   = toml::find_or(p, "enabled", cfg.plugins.enabled);
+                cfg.plugins.directory = toml::find_or(p, "directory", cfg.plugins.directory);
+            }
         }
     }
 
@@ -137,6 +143,14 @@ Config Config::load(const std::string& toml_path) {
 
     e = env("PARTIES_LOG_LEVEL");
     if (!e.empty()) cfg.log_level = e;
+
+    e = env("PARTIES_PLUGINS_ENABLED");
+    if (!e.empty()) {
+        cfg.plugins.enabled = (e == "1" || e == "true" || e == "TRUE" || e == "yes" || e == "YES");
+    }
+
+    e = env("PARTIES_PLUGINS_DIR");
+    if (!e.empty()) cfg.plugins.directory = e;
 
     return cfg;
 }

@@ -1036,6 +1036,8 @@ void AppCore::handle_server_message(protocol::ControlMessageType type,
         on_server_error(data, len); break;
     case protocol::ControlMessageType::CHAT_CHANNEL_LIST:
         on_chat_channel_list(data, len); break;
+    case protocol::ControlMessageType::CHAT_COMMAND_LIST:
+        on_chat_command_list(data, len); break;
     case protocol::ControlMessageType::CHAT_MESSAGE:
         on_chat_message(data, len); break;
     case protocol::ControlMessageType::CHAT_HISTORY_RESP:
@@ -2404,6 +2406,24 @@ void AppCore::on_chat_channel_list(const uint8_t* data, size_t len) {
         channels.push_back(std::move(tc));
     }
     chat_model_.text_channels.notify();
+}
+
+void AppCore::on_chat_command_list(const uint8_t* data, size_t len) {
+    BinaryReader reader(data, len);
+    uint16_t count = reader.read_u16();
+    if (reader.error()) return;
+
+    auto& commands = chat_model_.commands.silent();
+    commands.clear();
+    for (uint16_t i = 0; i < count; ++i) {
+        ChatCommandDefinition cmd;
+        cmd.name = reader.read_string();
+        cmd.description = reader.read_string();
+        cmd.usage = reader.read_string();
+        if (reader.error()) break;
+        commands.push_back(std::move(cmd));
+    }
+    chat_model_.commands.notify();
 }
 
 void AppCore::on_chat_message(const uint8_t* data, size_t len) {

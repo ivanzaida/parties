@@ -16,6 +16,7 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <string_view>
 #include <thread>
 
 namespace parties::server {
@@ -89,7 +90,13 @@ bool Server::start(const Config& cfg) {
         return false;
     }
 
+    if (!plugins_.load(config_.plugins)) {
+        LOG_ERROR("Failed to load plugins");
+        return false;
+    }
+
     running_ = true;
+    plugins_.on_server_started();
     LOG_INFO("{} started successfully", config_.server_name);
     return true;
 }
@@ -144,6 +151,7 @@ void Server::run() {
 void Server::stop() {
     if (!running_) return;
     running_ = false;
+    plugins_.shutdown();
     quic_.stop();
     db_.close();
     LOG_INFO("Server stopped");
@@ -336,6 +344,23 @@ void Server::send_text_channel_list(uint32_t session_id) {
     }
 
     quic_.send_to(session_id, protocol::ControlMessageType::CHAT_CHANNEL_LIST,
+                 writer.data().data(), writer.data().size());
+}
+
+void Server::send_chat_command_list(uint32_t session_id) {
+    const auto& commands = plugins_.chat_commands();
+
+    BinaryWriter writer;
+    writer.write_u16(static_cast<uint16_t>(std::min<size_t>(commands.size(), UINT16_MAX)));
+    size_t count = 0;
+    for (const auto& cmd : commands) {
+        if (count++ >= UINT16_MAX) break;
+        writer.write_string(cmd.name);
+        writer.write_string(cmd.description);
+        writer.write_string(cmd.usage);
+    }
+
+    quic_.send_to(session_id, protocol::ControlMessageType::CHAT_COMMAND_LIST,
                  writer.data().data(), writer.data().size());
 }
 
@@ -537,6 +562,8 @@ void Server::handle_message(const IncomingMessage& msg) {
         // Send channel list immediately after auth
         send_channel_list(msg.session_id);
         send_text_channel_list(msg.session_id);
+        send_chat_command_list(msg.session_id);
+        plugins_.on_session_authenticated(msg.session_id);
 
         // Send user lists for all channels so the client can see who's online
         {
@@ -1193,6 +1220,51 @@ void Server::handle_message(const IncomingMessage& msg) {
             break;
         }
 
+        if (text.size() > 1 && text[0] == '/') {
+            size_t name_start = 1;
+            size_t name_end = text.find_first_of(" \t\r\n", name_start);
+            std::string_view command_name(text.data() + name_start,
+                (name_end == std::string::npos ? text.size() : name_end) - name_start);
+            size_t args_start = name_end == std::string::npos ? text.size() : name_end;
+            while (args_start < text.size() &&
+                   (text[args_start] == ' ' || text[args_start] == '\t' ||
+                    text[args_start] == '\r' || text[args_start] == '\n')) {
+                ++args_start;
+            }
+            std::string_view args(text.data() + args_start, text.size() - args_start);
+
+            if (command_name.empty()) {
+                send_error(msg.session_id, "Unknown chat command");
+                break;
+            }
+
+            if (plugins_.dispatch_chat_command(msg.session_id, session->user_id, channel_id,
+                                               command_name, args, text)) {
+                break;
+            }
+
+            send_error(msg.session_id, "Unknown chat command");
+            break;
+        }
+
+        auto chat_result = plugins_.process_chat_message(
+            msg.session_id,
+            session->user_id,
+            channel_id,
+            session->username,
+            text,
+            attachment_count);
+        if (chat_result.code == PluginManager::ChatResultCode::Reject) {
+            send_error(msg.session_id, chat_result.error_message,
+                       protocol::ServerErrorCode::PermissionDenied);
+            break;
+        }
+
+        if (static_cast<int>(text.size()) > config_.chat.max_message_length) {
+            send_error(msg.session_id, "Message too long");
+            break;
+        }
+
         auto now = static_cast<uint64_t>(std::time(nullptr));
         uint64_t msg_id = db_.insert_message(channel_id, session->user_id,
                                               session->username, text, now);
@@ -1500,6 +1572,7 @@ void Server::process_disconnects() {
 
 void Server::process_disconnect(uint32_t session_id, UserId user_id, ChannelId channel_id) {
 	ZoneScopedN("Server::process_disconnect");
+    plugins_.on_session_disconnected(session_id, user_id, channel_id);
     if (channel_id == 0)
         return;
 
