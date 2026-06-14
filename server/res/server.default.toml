@@ -27,3 +27,15 @@ level = "info"
 [plugins]
 enabled = false
 directory = "plugins"
+
+# Plugins are default-deny. Add an allow entry for each plugin id you trust.
+# [[plugins.allow]]
+# id = "parties.example.bot_echo"
+# enabled = true
+# permissions = [
+#   "create_chat_commands",
+#   "create_bot_users",
+#   "send_bot_chat",
+#   "join_bot_voice",
+#   "send_bot_audio"
+# ]

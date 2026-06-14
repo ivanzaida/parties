@@ -60,8 +60,15 @@ bool Database::create_schema() {
             fingerprint   TEXT NOT NULL,
             role          INTEGER NOT NULL DEFAULT 3,
             created_at    TEXT NOT NULL DEFAULT (datetime('now')),
-            last_login    TEXT
+            last_login    TEXT,
+            is_bot        INTEGER NOT NULL DEFAULT 0,
+            bot_owner_plugin TEXT,
+            bot_key       TEXT
         );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_users_bot_identity
+            ON users(bot_owner_plugin, bot_key)
+            WHERE is_bot = 1;
 
         CREATE TABLE IF NOT EXISTS channels (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -146,7 +153,38 @@ bool Database::create_schema() {
         END;
     )SQL";
 
-    return exec(schema);
+    if (!exec(schema))
+        return false;
+
+    auto column_exists = [&](const char* table, const char* column) {
+        sqlite3_stmt* stmt = nullptr;
+        std::string sql = std::string("PRAGMA table_info(") + table + ")";
+        if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
+            return false;
+        bool found = false;
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            auto* name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+            if (name && std::strcmp(name, column) == 0) {
+                found = true;
+                break;
+            }
+        }
+        sqlite3_finalize(stmt);
+        return found;
+    };
+
+    if (!column_exists("users", "is_bot") &&
+        !exec("ALTER TABLE users ADD COLUMN is_bot INTEGER NOT NULL DEFAULT 0;"))
+        return false;
+    if (!column_exists("users", "bot_owner_plugin") &&
+        !exec("ALTER TABLE users ADD COLUMN bot_owner_plugin TEXT;"))
+        return false;
+    if (!column_exists("users", "bot_key") &&
+        !exec("ALTER TABLE users ADD COLUMN bot_key TEXT;"))
+        return false;
+
+    return exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_bot_identity "
+                "ON users(bot_owner_plugin, bot_key) WHERE is_bot = 1;");
 }
 
 // --- Users ---
@@ -170,6 +208,29 @@ bool Database::create_user(const PublicKey& pubkey, const std::string& display_n
     return ok;
 }
 
+bool Database::create_bot_user(const PublicKey& pubkey, const std::string& display_name,
+                               const std::string& fingerprint, const std::string& owner_plugin,
+                               const std::string& bot_key, Role role) {
+    sqlite3_stmt* stmt = nullptr;
+    const char* sql = "INSERT INTO users "
+                      "(public_key, display_name, fingerprint, role, is_bot, bot_owner_plugin, bot_key) "
+                      "VALUES (?, ?, ?, ?, 1, ?, ?)";
+
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
+        return false;
+
+    sqlite3_bind_blob(stmt, 1, pubkey.data(), static_cast<int>(pubkey.size()), SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, display_name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, fingerprint.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 4, static_cast<int>(role));
+    sqlite3_bind_text(stmt, 5, owner_plugin.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 6, bot_key.c_str(), -1, SQLITE_TRANSIENT);
+
+    bool ok = sqlite3_step(stmt) == SQLITE_DONE;
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
 static UserRow read_user_row(sqlite3_stmt* stmt) {
     UserRow row;
     row.id = static_cast<UserId>(sqlite3_column_int(stmt, 0));
@@ -185,13 +246,20 @@ static UserRow read_user_row(sqlite3_stmt* stmt) {
     row.created_at = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 5));
     if (sqlite3_column_type(stmt, 6) != SQLITE_NULL)
         row.last_login = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 6));
+    if (sqlite3_column_count(stmt) > 7)
+        row.is_bot = sqlite3_column_int(stmt, 7) != 0;
+    if (sqlite3_column_count(stmt) > 8 && sqlite3_column_type(stmt, 8) != SQLITE_NULL)
+        row.bot_owner_plugin = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 8));
+    if (sqlite3_column_count(stmt) > 9 && sqlite3_column_type(stmt, 9) != SQLITE_NULL)
+        row.bot_key = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 9));
 
     return row;
 }
 
 std::optional<UserRow> Database::get_user_by_pubkey(const PublicKey& pubkey) {
     sqlite3_stmt* stmt = nullptr;
-    const char* sql = "SELECT id, public_key, display_name, fingerprint, role, created_at, last_login "
+    const char* sql = "SELECT id, public_key, display_name, fingerprint, role, created_at, last_login, "
+                      "is_bot, bot_owner_plugin, bot_key "
                       "FROM users WHERE public_key = ?";
 
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
@@ -211,13 +279,37 @@ std::optional<UserRow> Database::get_user_by_pubkey(const PublicKey& pubkey) {
 
 std::optional<UserRow> Database::get_user_by_id(UserId id) {
     sqlite3_stmt* stmt = nullptr;
-    const char* sql = "SELECT id, public_key, display_name, fingerprint, role, created_at, last_login "
+    const char* sql = "SELECT id, public_key, display_name, fingerprint, role, created_at, last_login, "
+                      "is_bot, bot_owner_plugin, bot_key "
                       "FROM users WHERE id = ?";
 
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
         return std::nullopt;
 
     sqlite3_bind_int(stmt, 1, static_cast<int>(id));
+
+    if (sqlite3_step(stmt) != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        return std::nullopt;
+    }
+
+    auto row = read_user_row(stmt);
+    sqlite3_finalize(stmt);
+    return row;
+}
+
+std::optional<UserRow> Database::get_bot_user(const std::string& owner_plugin,
+                                              const std::string& bot_key) {
+    sqlite3_stmt* stmt = nullptr;
+    const char* sql = "SELECT id, public_key, display_name, fingerprint, role, created_at, last_login, "
+                      "is_bot, bot_owner_plugin, bot_key "
+                      "FROM users WHERE is_bot = 1 AND bot_owner_plugin = ? AND bot_key = ?";
+
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
+        return std::nullopt;
+
+    sqlite3_bind_text(stmt, 1, owner_plugin.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, bot_key.c_str(), -1, SQLITE_TRANSIENT);
 
     if (sqlite3_step(stmt) != SQLITE_ROW) {
         sqlite3_finalize(stmt);
@@ -273,7 +365,8 @@ bool Database::set_user_role(UserId id, Role role) {
 std::vector<UserRow> Database::get_all_users() {
     std::vector<UserRow> result;
     sqlite3_stmt* stmt = nullptr;
-    const char* sql = "SELECT id, public_key, display_name, fingerprint, role, created_at, last_login "
+    const char* sql = "SELECT id, public_key, display_name, fingerprint, role, created_at, last_login, "
+                      "is_bot, bot_owner_plugin, bot_key "
                       "FROM users ORDER BY id";
 
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)

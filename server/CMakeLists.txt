@@ -19,6 +19,7 @@ target_include_directories(parties_server
 
 target_link_libraries(parties_server
     PRIVATE
+        parties_plugin_sdk
         parties_common
         unofficial::sqlite3::sqlite3
         toml11::toml11

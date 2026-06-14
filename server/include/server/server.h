@@ -12,6 +12,8 @@
 #include <set>
 #include <thread>
 #include <unordered_map>
+#include <optional>
+#include <string_view>
 
 namespace parties::server {
 
@@ -44,6 +46,24 @@ private:
     void send_channel_list(uint32_t session_id);
     void send_text_channel_list(uint32_t session_id);
     void send_chat_command_list(uint32_t session_id);
+    std::optional<UserId> create_plugin_bot_user(std::string_view plugin_id,
+                                                 std::string_view key,
+                                                 std::string_view display_name);
+    std::optional<uint64_t> store_and_broadcast_chat_message(UserId sender_id,
+                                                             std::string_view sender_name,
+                                                             uint32_t channel_id,
+                                                             std::string_view text);
+    bool join_plugin_bot_voice(UserId user_id,
+                               std::string_view display_name,
+                               ChannelId voice_channel_id);
+    bool leave_plugin_bot_voice(UserId user_id,
+                                std::string_view display_name,
+                                ChannelId voice_channel_id);
+    bool send_plugin_bot_voice_packet(UserId user_id,
+                                      ChannelId voice_channel_id,
+                                      uint16_t sequence,
+                                      const uint8_t* opus_payload,
+                                      size_t opus_payload_len);
 
     // Screen sharing
     void forward_video_frame(uint32_t session_id, const uint8_t* data, size_t len);

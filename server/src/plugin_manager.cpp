@@ -16,6 +16,10 @@
 #include <dlfcn.h>
 #endif
 
+namespace parties::plugin {
+struct Bot {};
+} // namespace parties::plugin
+
 namespace parties::server {
 
 struct PluginManager::NativeLibrary {
@@ -56,6 +60,19 @@ struct PluginManager::NativeLibrary {
     }
 };
 
+struct PluginManager::Bot : plugin::Bot {
+    Plugin* owner = nullptr;
+    plugin::UserId user_id = 0;
+    plugin::ChannelId voice_channel_id = 0;
+    std::string display_name;
+    bool destroyed = false;
+};
+
+struct PluginManager::PluginGrant {
+    bool enabled = true;
+    std::unordered_set<std::string> permissions;
+};
+
 struct PluginManager::Plugin {
     PluginManager* manager = nullptr;
     std::string id;
@@ -67,12 +84,17 @@ struct PluginManager::Plugin {
     NativeLibrary library;
     plugin::Registration registration{};
     plugin::ShutdownFn shutdown = nullptr;
+    std::vector<std::unique_ptr<Bot>> bots;
 };
 
 PluginManager::PluginManager() = default;
 
 PluginManager::~PluginManager() {
     shutdown();
+}
+
+void PluginManager::set_host_services(HostServices services) {
+    services_ = std::move(services);
 }
 
 static bool valid_command_name(std::string_view name) {
@@ -106,6 +128,17 @@ bool PluginManager::load(const PluginConfig& cfg) {
         return true;
     }
 
+    grants_.clear();
+    for (const auto& allow : cfg.allow) {
+        PluginGrant grant;
+        grant.enabled = allow.enabled;
+        for (const auto& permission : allow.permissions)
+            grant.permissions.insert(permission);
+        grants_[allow.id] = std::move(grant);
+    }
+    if (grants_.empty())
+        LOG_WARN("Plugin loading enabled, but no plugins are allowed in config");
+
     std::filesystem::path dir = cfg.directory;
     if (!std::filesystem::exists(dir)) {
         LOG_WARN("Plugin directory '{}' does not exist", dir.string());
@@ -134,6 +167,7 @@ void PluginManager::shutdown() {
     }
     plugins_.clear();
     chat_commands_.clear();
+    grants_.clear();
     enabled_ = false;
 }
 
@@ -163,8 +197,24 @@ bool PluginManager::load_manifest(const std::filesystem::path& manifest_path) {
         return false;
     }
 
-    for (auto& perm : read_string_array(manifest, "permissions"))
-        plugin->permissions.insert(std::move(perm));
+    auto grant_it = grants_.find(plugin->id);
+    if (grant_it == grants_.end()) {
+        LOG_WARN("Plugin '{}' is not allowed by server config", plugin->id);
+        return false;
+    }
+    if (!grant_it->second.enabled) {
+        LOG_INFO("Plugin '{}' is disabled by server config", plugin->id);
+        return false;
+    }
+
+    auto requested_permissions = read_string_array(manifest, "permissions");
+    for (auto& perm : requested_permissions) {
+        if (grant_it->second.permissions.find(perm) != grant_it->second.permissions.end()) {
+            plugin->permissions.insert(std::move(perm));
+        } else {
+            LOG_WARN("Plugin '{}' requested ungranted permission '{}'", plugin->id, perm);
+        }
+    }
 
     plugin->library_path = manifest_path.parent_path() / library;
     if (!plugin->library.open(plugin->library_path)) {
@@ -185,6 +235,13 @@ bool PluginManager::load_manifest(const std::filesystem::path& manifest_path) {
     host.log = &PluginManager::host_log;
     host.now_ms = &PluginManager::host_now_ms;
     host.create_chat_commands = &PluginManager::host_create_chat_commands;
+    host.create_bot_user = &PluginManager::host_create_bot_user;
+    host.destroy_bot_user = &PluginManager::host_destroy_bot_user;
+    host.set_bot_display_name = &PluginManager::host_set_bot_display_name;
+    host.send_bot_chat = &PluginManager::host_send_bot_chat;
+    host.join_bot_voice = &PluginManager::host_join_bot_voice;
+    host.leave_bot_voice = &PluginManager::host_leave_bot_voice;
+    host.send_bot_voice_packet = &PluginManager::host_send_bot_voice_packet;
 
     plugin->registration = {};
     plugin->registration.abi = plugin::make_abi_header<plugin::Registration>();
@@ -228,6 +285,45 @@ void PluginManager::on_session_disconnected(plugin::SessionId session,
     for (auto& plugin : plugins_) {
         if (plugin->registration.on_session_disconnected)
             plugin->registration.on_session_disconnected(session, user_id, voice_channel_id);
+    }
+}
+
+std::vector<PluginManager::BotVoiceParticipant> PluginManager::bot_voice_participants(
+    plugin::ChannelId channel_id) const {
+    std::vector<BotVoiceParticipant> result;
+    for (const auto& owner : plugins_) {
+        for (const auto& bot : owner->bots) {
+            if (bot->destroyed || bot->voice_channel_id == 0)
+                continue;
+            if (channel_id != 0 && bot->voice_channel_id != channel_id)
+                continue;
+            result.push_back(BotVoiceParticipant{
+                bot->user_id,
+                bot->voice_channel_id,
+                bot->display_name,
+            });
+        }
+    }
+    return result;
+}
+
+uint32_t PluginManager::bot_voice_count(plugin::ChannelId channel_id) const {
+    uint32_t count = 0;
+    for (const auto& owner : plugins_) {
+        for (const auto& bot : owner->bots) {
+            if (!bot->destroyed && bot->voice_channel_id == channel_id)
+                ++count;
+        }
+    }
+    return count;
+}
+
+void PluginManager::clear_bot_voice_channel(plugin::ChannelId channel_id) {
+    for (const auto& owner : plugins_) {
+        for (const auto& bot : owner->bots) {
+            if (!bot->destroyed && bot->voice_channel_id == channel_id)
+                bot->voice_channel_id = 0;
+        }
     }
 }
 
@@ -361,13 +457,212 @@ bool PluginManager::host_create_chat_commands(void* context,
     return plugin->manager->register_chat_commands(*plugin, commands, command_count);
 }
 
+bool PluginManager::host_create_bot_user(void* context,
+                                         const char* key,
+                                         const char* display_name,
+                                         plugin::BotHandle* out_bot,
+                                         plugin::UserId* out_user_id) {
+    if (out_bot) *out_bot = nullptr;
+    if (out_user_id) *out_user_id = 0;
+
+    auto* plugin = static_cast<Plugin*>(context);
+    if (!plugin || !plugin->manager) return false;
+    if (!plugin->manager->check_host_permission(*plugin, "create_bot_users", "create bot users"))
+        return false;
+
+    if (!key || !key[0]) {
+        LOG_WARN("Plugin '{}' tried to create a bot user with an empty key", plugin->id);
+        return false;
+    }
+    if (!display_name || !display_name[0]) {
+        LOG_WARN("Plugin '{}' tried to create bot user '{}' with an empty display name", plugin->id, key);
+        return false;
+    }
+    if (!plugin->manager->services_.create_bot_user) {
+        LOG_WARN("Plugin '{}' tried to create a bot user, but bot user creation is unavailable", plugin->id);
+        return false;
+    }
+
+    auto user_id = plugin->manager->services_.create_bot_user(plugin->id, key, display_name);
+    if (!user_id || *user_id == 0) {
+        LOG_WARN("Plugin '{}' failed to create bot user '{}' ('{}')",
+                 plugin->id, key, display_name);
+        return false;
+    }
+
+    auto bot = std::make_unique<Bot>();
+    bot->owner = plugin;
+    bot->user_id = *user_id;
+    bot->display_name = display_name;
+
+    plugin::BotHandle handle = static_cast<plugin::BotHandle>(bot.get());
+    plugin->bots.push_back(std::move(bot));
+
+    if (out_bot) *out_bot = handle;
+    if (out_user_id) *out_user_id = *user_id;
+    LOG_INFO("Plugin '{}' created bot user '{}' (user_id={})",
+             plugin->id, display_name, *user_id);
+    return true;
+}
+
+bool PluginManager::host_destroy_bot_user(void* context, plugin::BotHandle bot_handle) {
+    auto* plugin = static_cast<Plugin*>(context);
+    if (!plugin || !plugin->manager) return false;
+    if (!plugin->manager->check_host_permission(*plugin, "create_bot_users", "destroy bot users"))
+        return false;
+
+    Bot* bot = plugin->manager->get_owned_bot(*plugin, bot_handle);
+    if (!bot) return false;
+
+    bot->destroyed = true;
+    bot->voice_channel_id = 0;
+    LOG_INFO("Plugin '{}' destroyed bot user '{}' (user_id={})",
+             plugin->id, bot->display_name, bot->user_id);
+    return true;
+}
+
+bool PluginManager::host_set_bot_display_name(void* context,
+                                              plugin::BotHandle bot_handle,
+                                              const char* display_name) {
+    auto* plugin = static_cast<Plugin*>(context);
+    if (!plugin || !plugin->manager) return false;
+    if (!plugin->manager->check_host_permission(*plugin, "create_bot_users", "rename bot users"))
+        return false;
+
+    Bot* bot = plugin->manager->get_owned_bot(*plugin, bot_handle);
+    if (!bot) return false;
+    if (!display_name || !display_name[0]) {
+        LOG_WARN("Plugin '{}' tried to rename a bot user to an empty display name", plugin->id);
+        return false;
+    }
+    if (!plugin->manager->services_.set_bot_display_name) {
+        LOG_WARN("Plugin '{}' tried to rename a bot user, but bot user updates are unavailable", plugin->id);
+        return false;
+    }
+    if (!plugin->manager->services_.set_bot_display_name(bot->user_id, display_name)) {
+        LOG_WARN("Plugin '{}' failed to rename bot user {} to '{}'",
+                 plugin->id, bot->user_id, display_name);
+        return false;
+    }
+
+    bot->display_name = display_name;
+    return true;
+}
+
+bool PluginManager::host_send_bot_chat(void* context,
+                                       plugin::BotHandle bot_handle,
+                                       plugin::ChannelId text_channel_id,
+                                       const char* text,
+                                       plugin::MessageId* out_message_id) {
+    if (out_message_id) *out_message_id = 0;
+
+    auto* plugin = static_cast<Plugin*>(context);
+    if (!plugin || !plugin->manager) return false;
+    if (!plugin->manager->check_host_permission(*plugin, "send_bot_chat", "send bot chat"))
+        return false;
+
+    Bot* bot = plugin->manager->get_owned_bot(*plugin, bot_handle);
+    if (!bot) return false;
+    if (!text) text = "";
+    if (!plugin->manager->services_.send_bot_chat) {
+        LOG_WARN("Plugin '{}' tried to send bot chat, but bot chat is unavailable", plugin->id);
+        return false;
+    }
+
+    auto message_id = plugin->manager->services_.send_bot_chat(
+        bot->user_id, bot->display_name, text_channel_id, text);
+    if (!message_id || *message_id == 0) {
+        LOG_WARN("Plugin '{}' failed to send bot chat as '{}' (user_id={})",
+                 plugin->id, bot->display_name, bot->user_id);
+        return false;
+    }
+
+    if (out_message_id) *out_message_id = *message_id;
+    return true;
+}
+
+bool PluginManager::host_join_bot_voice(void* context,
+                                        plugin::BotHandle bot_handle,
+                                        plugin::ChannelId voice_channel_id) {
+    auto* plugin = static_cast<Plugin*>(context);
+    if (!plugin || !plugin->manager) return false;
+    if (!plugin->manager->check_host_permission(*plugin, "join_bot_voice", "join bot voice"))
+        return false;
+
+    Bot* bot = plugin->manager->get_owned_bot(*plugin, bot_handle);
+    if (!bot) return false;
+    if (bot->voice_channel_id == voice_channel_id)
+        return true;
+    if (!plugin->manager->services_.join_bot_voice) {
+        LOG_WARN("Plugin '{}' tried to join bot voice, but bot voice is unavailable", plugin->id);
+        return false;
+    }
+
+    plugin::ChannelId old_channel_id = bot->voice_channel_id;
+    if (old_channel_id != 0) {
+        if (plugin->manager->services_.leave_bot_voice)
+            plugin->manager->services_.leave_bot_voice(bot->user_id, bot->display_name, old_channel_id);
+        bot->voice_channel_id = 0;
+    }
+
+    if (!plugin->manager->services_.join_bot_voice(bot->user_id, bot->display_name, voice_channel_id))
+        return false;
+
+    bot->voice_channel_id = voice_channel_id;
+    return true;
+}
+
+bool PluginManager::host_leave_bot_voice(void* context, plugin::BotHandle bot_handle) {
+    auto* plugin = static_cast<Plugin*>(context);
+    if (!plugin || !plugin->manager) return false;
+    if (!plugin->manager->check_host_permission(*plugin, "join_bot_voice", "leave bot voice"))
+        return false;
+
+    Bot* bot = plugin->manager->get_owned_bot(*plugin, bot_handle);
+    if (!bot) return false;
+    if (bot->voice_channel_id == 0)
+        return true;
+    if (!plugin->manager->services_.leave_bot_voice) {
+        LOG_WARN("Plugin '{}' tried to leave bot voice, but bot voice is unavailable", plugin->id);
+        return false;
+    }
+
+    plugin::ChannelId old_channel_id = bot->voice_channel_id;
+    if (!plugin->manager->services_.leave_bot_voice(bot->user_id, bot->display_name, old_channel_id))
+        return false;
+
+    bot->voice_channel_id = 0;
+    return true;
+}
+
+bool PluginManager::host_send_bot_voice_packet(void* context,
+                                               plugin::BotHandle bot_handle,
+                                               uint16_t sequence,
+                                               const uint8_t* opus_payload,
+                                               size_t opus_payload_len) {
+    auto* plugin = static_cast<Plugin*>(context);
+    if (!plugin || !plugin->manager) return false;
+    if (!plugin->manager->check_host_permission(*plugin, "send_bot_audio", "send bot audio"))
+        return false;
+
+    Bot* bot = plugin->manager->get_owned_bot(*plugin, bot_handle);
+    if (!bot) return false;
+    if (bot->voice_channel_id == 0 || !opus_payload || opus_payload_len == 0)
+        return false;
+    if (!plugin->manager->services_.send_bot_voice_packet) {
+        LOG_WARN("Plugin '{}' tried to send bot audio, but bot audio is unavailable", plugin->id);
+        return false;
+    }
+
+    return plugin->manager->services_.send_bot_voice_packet(
+        bot->user_id, bot->voice_channel_id, sequence, opus_payload, opus_payload_len);
+}
+
 bool PluginManager::register_chat_commands(Plugin& plugin,
                                            const plugin::CommandDefinition* commands,
                                            size_t command_count) {
-    if (!has_permission(plugin, "create_chat_commands")) {
-        LOG_WARN("Plugin '{}' tried to register chat commands without permission", plugin.id);
+    if (!check_host_permission(plugin, "create_chat_commands", "register chat commands"))
         return false;
-    }
     if (!commands && command_count != 0)
         return false;
 
@@ -396,6 +691,31 @@ bool PluginManager::register_chat_commands(Plugin& plugin,
     }
 
     return all_ok;
+}
+
+PluginManager::Bot* PluginManager::get_owned_bot(Plugin& plugin, plugin::BotHandle bot_handle) const {
+    if (!bot_handle) {
+        LOG_WARN("Plugin '{}' passed a null bot handle", plugin.id);
+        return nullptr;
+    }
+
+    auto* bot = static_cast<Bot*>(bot_handle);
+    if (bot->owner != &plugin || bot->destroyed) {
+        LOG_WARN("Plugin '{}' passed an invalid bot handle", plugin.id);
+        return nullptr;
+    }
+    return bot;
+}
+
+bool PluginManager::check_host_permission(Plugin& plugin,
+                                          std::string_view permission,
+                                          std::string_view action) const {
+    if (has_permission(plugin, permission))
+        return true;
+
+    LOG_WARN("Plugin '{}' tried to {} without '{}' permission",
+             plugin.id, action, permission);
+    return false;
 }
 
 bool PluginManager::has_permission(const Plugin& plugin, std::string_view permission) const {

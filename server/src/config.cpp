@@ -95,6 +95,23 @@ Config Config::load(const std::string& toml_path) {
                 auto& p = data.at("plugins");
                 cfg.plugins.enabled   = toml::find_or(p, "enabled", cfg.plugins.enabled);
                 cfg.plugins.directory = toml::find_or(p, "directory", cfg.plugins.directory);
+                cfg.plugins.allow.clear();
+                if (p.contains("allow")) {
+                    try {
+                        auto entries = toml::find<std::vector<toml::value>>(p, "allow");
+                        for (const auto& entry : entries) {
+                            PluginConfig::Allow allow;
+                            allow.id = toml::find_or(entry, "id", std::string{});
+                            allow.enabled = toml::find_or(entry, "enabled", allow.enabled);
+                            if (entry.contains("permissions"))
+                                allow.permissions = toml::find<std::vector<std::string>>(entry, "permissions");
+                            if (!allow.id.empty())
+                                cfg.plugins.allow.push_back(std::move(allow));
+                        }
+                    } catch (const std::exception& e) {
+                        LOG_WARN("Invalid plugins.allow config: {}", e.what());
+                    }
+                }
             }
         }
     }

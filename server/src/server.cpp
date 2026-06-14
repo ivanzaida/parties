@@ -1,5 +1,6 @@
 #include <server/server.h>
 #include <parties/crypto.h>
+#include <parties/audio_common.h>
 #include <parties/protocol.h>
 #include <parties/serialization.h>
 #include <parties/types.h>
@@ -18,6 +19,8 @@
 #include <fstream>
 #include <string_view>
 #include <thread>
+
+#include <openssl/sha.h>
 
 namespace parties::server {
 
@@ -89,6 +92,42 @@ bool Server::start(const Config& cfg) {
                   config_.chat.file_storage_path, e.what());
         return false;
     }
+
+    PluginManager::HostServices plugin_services;
+    plugin_services.create_bot_user = [this](std::string_view plugin_id,
+                                             std::string_view key,
+                                             std::string_view display_name) {
+        return create_plugin_bot_user(plugin_id, key, display_name);
+    };
+    plugin_services.set_bot_display_name = [this](UserId user_id,
+                                                  std::string_view display_name) {
+        return db_.update_display_name(user_id, std::string(display_name));
+    };
+    plugin_services.send_bot_chat = [this](UserId user_id,
+                                           std::string_view display_name,
+                                           ChannelId text_channel_id,
+                                           std::string_view text) {
+        return store_and_broadcast_chat_message(user_id, display_name, text_channel_id, text);
+    };
+    plugin_services.join_bot_voice = [this](UserId user_id,
+                                            std::string_view display_name,
+                                            ChannelId voice_channel_id) {
+        return join_plugin_bot_voice(user_id, display_name, voice_channel_id);
+    };
+    plugin_services.leave_bot_voice = [this](UserId user_id,
+                                             std::string_view display_name,
+                                             ChannelId voice_channel_id) {
+        return leave_plugin_bot_voice(user_id, display_name, voice_channel_id);
+    };
+    plugin_services.send_bot_voice_packet = [this](UserId user_id,
+                                                   ChannelId voice_channel_id,
+                                                   uint16_t sequence,
+                                                   const uint8_t* opus_payload,
+                                                   size_t opus_payload_len) {
+        return send_plugin_bot_voice_packet(user_id, voice_channel_id, sequence,
+                                            opus_payload, opus_payload_len);
+    };
+    plugins_.set_host_services(std::move(plugin_services));
 
     if (!plugins_.load(config_.plugins)) {
         LOG_ERROR("Failed to load plugins");
@@ -306,6 +345,191 @@ void Server::send_error(uint32_t session_id, const std::string& message,
                  writer.data().data(), writer.data().size());
 }
 
+std::optional<UserId> Server::create_plugin_bot_user(std::string_view plugin_id,
+                                                     std::string_view key,
+                                                     std::string_view display_name) {
+    if (key.empty() || display_name.empty())
+        return std::nullopt;
+
+    if (auto existing = db_.get_bot_user(std::string(plugin_id), std::string(key))) {
+        if (existing->display_name != display_name)
+            db_.update_display_name(existing->id, std::string(display_name));
+        LOG_INFO("Reusing bot user '{}' (key='{}') for plugin '{}' (user_id={})",
+                 display_name, key, plugin_id, existing->id);
+        return existing->id;
+    }
+
+    std::string identity;
+    identity.reserve(plugin_id.size() + key.size() + 24);
+    identity += "parties-plugin-bot:";
+    identity += plugin_id;
+    identity.push_back('\0');
+    identity += key;
+
+    PublicKey public_key{};
+    SHA256(reinterpret_cast<const uint8_t*>(identity.data()), identity.size(), public_key.data());
+
+    if (auto existing = db_.get_user_by_pubkey(public_key)) {
+        if (existing->display_name != display_name)
+            db_.update_display_name(existing->id, std::string(display_name));
+        LOG_INFO("Reusing bot user '{}' (key='{}') for plugin '{}' (user_id={})",
+                 display_name, key, plugin_id, existing->id);
+        return existing->id;
+    }
+
+    std::string fingerprint = "bot:";
+    fingerprint += plugin_id;
+    fingerprint += ":";
+    fingerprint += public_key_fingerprint(public_key);
+
+    if (!db_.create_bot_user(public_key, std::string(display_name), fingerprint,
+                             std::string(plugin_id), std::string(key), Role::User)) {
+        if (auto existing = db_.get_bot_user(std::string(plugin_id), std::string(key))) {
+            LOG_INFO("Reusing bot user '{}' (key='{}') for plugin '{}' (user_id={})",
+                     display_name, key, plugin_id, existing->id);
+            return existing->id;
+        }
+        LOG_ERROR("Failed to persist bot user '{}' (key='{}') for plugin '{}'",
+                  display_name, key, plugin_id);
+        return std::nullopt;
+    }
+
+    auto user = db_.get_user_by_pubkey(public_key);
+    if (!user)
+        return std::nullopt;
+
+    return user->id;
+}
+
+std::optional<uint64_t> Server::store_and_broadcast_chat_message(UserId sender_id,
+                                                                 std::string_view sender_name,
+                                                                 uint32_t channel_id,
+                                                                 std::string_view text) {
+    auto ch = db_.get_text_channel(channel_id);
+    if (!ch)
+        return std::nullopt;
+
+    if (static_cast<int>(text.size()) > config_.chat.max_message_length)
+        return std::nullopt;
+
+    auto now = static_cast<uint64_t>(std::time(nullptr));
+    uint64_t msg_id = db_.insert_message(channel_id, sender_id,
+                                         std::string(sender_name),
+                                         std::string(text), now);
+    if (msg_id == 0)
+        return std::nullopt;
+
+    BinaryWriter writer;
+    writer.write_u64(msg_id);
+    writer.write_u32(channel_id);
+    writer.write_u32(sender_id);
+    writer.write_string(std::string(sender_name));
+    writer.write_u64(now);
+    writer.write_string(std::string(text));
+    writer.write_u8(0); // pinned = false
+    writer.write_u8(0); // attachment count
+
+    auto all = quic_.get_sessions();
+    for (auto& s : all) {
+        if (s->authenticated)
+            quic_.send_to(s->id, protocol::ControlMessageType::CHAT_MESSAGE,
+                          writer.data().data(), writer.data().size());
+    }
+
+    return msg_id;
+}
+
+bool Server::join_plugin_bot_voice(UserId user_id,
+                                   std::string_view display_name,
+                                   ChannelId voice_channel_id) {
+    auto channel = db_.get_channel(voice_channel_id);
+    if (!channel)
+        return false;
+
+    int max = channel->max_users > 0 ? channel->max_users : config_.max_users_per_channel;
+    if (max > 0) {
+        uint32_t count = plugins_.bot_voice_count(voice_channel_id);
+        auto all = quic_.get_sessions();
+        for (auto& s : all) {
+            if (s->authenticated && s->channel_id == voice_channel_id)
+                ++count;
+        }
+        if (static_cast<int>(count) >= max)
+            return false;
+    }
+
+    BinaryWriter writer;
+    writer.write_u32(user_id);
+    writer.write_string(std::string(display_name));
+    writer.write_u32(voice_channel_id);
+    writer.write_u8(static_cast<uint8_t>(Role::User));
+
+    auto all = quic_.get_sessions();
+    for (auto& s : all) {
+        if (s->authenticated)
+            quic_.send_to(s->id, protocol::ControlMessageType::USER_JOINED_CHANNEL,
+                          writer.data().data(), writer.data().size());
+    }
+
+    LOG_INFO("Bot '{}' joined channel '{}' ({})", display_name, channel->name, voice_channel_id);
+    return true;
+}
+
+bool Server::leave_plugin_bot_voice(UserId user_id,
+                                    std::string_view display_name,
+                                    ChannelId voice_channel_id) {
+    if (voice_channel_id == 0)
+        return true;
+
+    BinaryWriter writer;
+    writer.write_u32(user_id);
+    writer.write_u32(voice_channel_id);
+
+    auto all = quic_.get_sessions();
+    for (auto& s : all) {
+        if (s->authenticated)
+            quic_.send_to(s->id, protocol::ControlMessageType::USER_LEFT_CHANNEL,
+                          writer.data().data(), writer.data().size());
+    }
+
+    LOG_INFO("Bot '{}' left channel {}", display_name, voice_channel_id);
+    return true;
+}
+
+bool Server::send_plugin_bot_voice_packet(UserId user_id,
+                                          ChannelId voice_channel_id,
+                                          uint16_t sequence,
+                                          const uint8_t* opus_payload,
+                                          size_t opus_payload_len) {
+    if (voice_channel_id == 0 || !opus_payload || opus_payload_len == 0 ||
+        opus_payload_len > static_cast<size_t>(audio::MAX_OPUS_PACKET)) {
+        return false;
+    }
+
+    std::vector<uint8_t> fwd;
+    fwd.reserve(1 + 4 + 2 + opus_payload_len);
+    fwd.push_back(protocol::VOICE_PACKET_TYPE);
+    fwd.insert(fwd.end(), reinterpret_cast<uint8_t*>(&user_id),
+               reinterpret_cast<uint8_t*>(&user_id) + 4);
+    fwd.insert(fwd.end(), reinterpret_cast<uint8_t*>(&sequence),
+               reinterpret_cast<uint8_t*>(&sequence) + 2);
+    fwd.insert(fwd.end(), opus_payload, opus_payload + opus_payload_len);
+
+    auto all = quic_.get_sessions();
+    std::vector<uint32_t> targets;
+    for (auto& s : all) {
+        if (s->authenticated &&
+            s->channel_id == voice_channel_id &&
+            !s->deafened) {
+            targets.push_back(s->id);
+        }
+    }
+    if (!targets.empty())
+        quic_.send_to_many(targets, fwd.data(), fwd.size());
+
+    return true;
+}
+
 void Server::send_channel_list(uint32_t session_id) {
 	ZoneScopedN("Server::send_channel_list");
     auto channels = db_.get_all_channels();
@@ -325,6 +549,7 @@ void Server::send_channel_list(uint32_t session_id) {
             if (s->authenticated && s->channel_id == ch.id)
                 user_count++;
         }
+        user_count += plugins_.bot_voice_count(ch.id);
         writer.write_u32(user_count);
     }
 
@@ -577,6 +802,8 @@ void Server::handle_message(const IncomingMessage& msg) {
                     if (s->authenticated && s->channel_id == ch.id)
                         count++;
                 }
+                auto bots = plugins_.bot_voice_participants(ch.id);
+                count += static_cast<uint32_t>(bots.size());
                 list_writer.write_u32(count);
                 for (auto& s : all_sessions) {
                     if (s->authenticated && s->channel_id == ch.id) {
@@ -586,6 +813,13 @@ void Server::handle_message(const IncomingMessage& msg) {
                         list_writer.write_u8(s->muted ? 1 : 0);
                         list_writer.write_u8(s->deafened ? 1 : 0);
                     }
+                }
+                for (const auto& bot : bots) {
+                    list_writer.write_u32(bot.user_id);
+                    list_writer.write_string(bot.display_name);
+                    list_writer.write_u8(static_cast<uint8_t>(Role::User));
+                    list_writer.write_u8(0);
+                    list_writer.write_u8(0);
                 }
                 if (count > 0) {
                     quic_.send_to(msg.session_id, protocol::ControlMessageType::CHANNEL_USER_LIST,
@@ -637,6 +871,8 @@ void Server::handle_message(const IncomingMessage& msg) {
                 if (s->authenticated && s->channel_id == channel_id)
                     count++;
             }
+            auto bots = plugins_.bot_voice_participants(channel_id);
+            count += static_cast<uint32_t>(bots.size());
             if (static_cast<int>(count) >= max) {
                 send_error(msg.session_id, "Channel is full");
                 break;
@@ -672,6 +908,8 @@ void Server::handle_message(const IncomingMessage& msg) {
                 if (s->authenticated && s->channel_id == channel_id)
                     count++;
             }
+            auto bots = plugins_.bot_voice_participants(channel_id);
+            count += static_cast<uint32_t>(bots.size());
             list_writer.write_u32(channel_id);
             list_writer.write_u32(count);
             for (auto& s : all) {
@@ -682,6 +920,13 @@ void Server::handle_message(const IncomingMessage& msg) {
                     list_writer.write_u8(s->muted ? 1 : 0);
                     list_writer.write_u8(s->deafened ? 1 : 0);
                 }
+            }
+            for (const auto& bot : bots) {
+                list_writer.write_u32(bot.user_id);
+                list_writer.write_string(bot.display_name);
+                list_writer.write_u8(static_cast<uint8_t>(Role::User));
+                list_writer.write_u8(0);
+                list_writer.write_u8(0);
             }
             quic_.send_to(msg.session_id, protocol::ControlMessageType::CHANNEL_USER_LIST,
                          list_writer.data().data(), list_writer.data().size());
@@ -843,6 +1088,18 @@ void Server::handle_message(const IncomingMessage& msg) {
                                leave_writer.data().data(), leave_writer.data().size());
             }
         }
+        auto bots = plugins_.bot_voice_participants(channel_id);
+        for (const auto& bot : bots) {
+            BinaryWriter leave_writer;
+            leave_writer.write_u32(bot.user_id);
+            leave_writer.write_u32(channel_id);
+            for (auto& s : all) {
+                if (s->authenticated)
+                    quic_.send_to(s->id, protocol::ControlMessageType::USER_LEFT_CHANNEL,
+                                  leave_writer.data().data(), leave_writer.data().size());
+            }
+        }
+        plugins_.clear_bot_voice_channel(channel_id);
 
         if (!db_.delete_channel(channel_id)) {
             send_error(msg.session_id, "Failed to delete channel");

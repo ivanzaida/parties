@@ -17,8 +17,15 @@ struct ChatConfig {
 };
 
 struct PluginConfig {
+    struct Allow {
+        std::string id;
+        bool enabled = true;
+        std::vector<std::string> permissions;
+    };
+
     bool        enabled   = false;
     std::string directory = "plugins";
+    std::vector<Allow> allow;
 };
 
 struct Config {

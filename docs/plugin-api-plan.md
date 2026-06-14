@@ -145,9 +145,14 @@ Plugins receive opaque handles, not internal objects.
 typedef uint32_t PartiesSessionId;
 typedef uint32_t PartiesUserId;
 typedef uint32_t PartiesChannelId;
-typedef uint32_t PartiesBotId;
 typedef uint64_t PartiesMessageId;
+
+struct PartiesBot;
+typedef PartiesBot* PartiesBotHandle;
 ```
+
+`PartiesBotHandle` is opaque and server-owned. Plugins pass it back to host
+functions but must not dereference it or persist it across server runs.
 
 Session snapshots are read-only:
 
@@ -170,7 +175,7 @@ Bot snapshots are also read-only:
 ```cpp
 struct PartiesBotInfo {
     PartiesAbiHeader abi;
-    PartiesBotId bot_id;
+    PartiesBotHandle bot;
     PartiesUserId user_id;
     PartiesChannelId voice_channel_id;
     const char* display_name;
@@ -336,28 +341,37 @@ as normal participants.
 Bots are not authenticated client sessions. They are synthetic server-side users
 owned by a plugin.
 
+A plugin can create zero, one, or many bot users. Each successful creation
+returns a distinct opaque `PartiesBotHandle`; the API must not assume a
+plugin-wide singleton bot.
+
+Bot users should be reused across plugin restarts instead of recreated.
+`plugin_id + key` is the stable identity key. `key` is plugin-defined identity
+and should not change; `display_name` is client-facing presentation text and can
+be changed later.
+
 Because stored chat messages currently require `sender_id` to reference
-`users(id)`, v1 bot users should be persisted as synthetic rows in the existing
-`users` table.
+`users(id)`, v1 bot users are persisted as synthetic rows in the existing
+`users` table with explicit bot metadata.
 
 Recommended persistence model:
 
-- Generate a deterministic synthetic public key from `plugin_id + bot_name`.
-- Store a fingerprint with a reserved prefix, for example `bot:<plugin_id>:<name>`.
+- Generate a deterministic synthetic public key from `plugin_id + key`.
+- Store a fingerprint with a reserved prefix, for example `bot:<plugin_id>:<key>`.
+- Store `is_bot = 1`, `bot_owner_plugin = plugin_id`, and `bot_key = key`.
 - Use `Role::User` by default.
-- Add a future migration for an explicit `users.is_bot` column if the UI or admin
-  tools need to distinguish bots cleanly.
 
 Host API:
 
 ```cpp
-bool (*create_bot_user)(const char* display_name,
-                        PartiesBotId* out_bot_id,
+bool (*create_bot_user)(const char* key,
+                        const char* display_name,
+                        PartiesBotHandle* out_bot,
                         PartiesUserId* out_user_id);
 
-bool (*destroy_bot_user)(PartiesBotId bot_id);
+bool (*destroy_bot_user)(PartiesBotHandle bot);
 
-bool (*set_bot_display_name)(PartiesBotId bot_id,
+bool (*set_bot_display_name)(PartiesBotHandle bot,
                              const char* display_name);
 ```
 
@@ -370,7 +384,8 @@ Bot behavior:
 - Bot users should be marked internally as server-owned so they cannot be
   moderated as if they were remote client sessions.
 - Bot lifetime is owned by the creating plugin.
-- All bot users from a plugin are destroyed when that plugin shuts down.
+- Plugins may destroy individual bots. All bot users from a plugin are destroyed
+  when that plugin shuts down.
 
 Presence implementation note:
 
@@ -386,7 +401,7 @@ Plugins can send chat messages as bot users.
 Host API:
 
 ```cpp
-bool (*send_bot_chat)(PartiesBotId bot_id,
+bool (*send_bot_chat)(PartiesBotHandle bot,
                       PartiesChannelId text_channel_id,
                       const char* text,
                       PartiesMessageId* out_message_id);
@@ -396,6 +411,7 @@ Rules:
 
 - Bot chat follows the normal storage and broadcast path.
 - Bot chat should be marked with the bot's `UserId` and display name.
+- Multiple bots from the same plugin may send chat independently.
 - Bot chat should not recursively call `on_chat_message` by default. If a plugin
   needs bot messages to be intercepted too, add an explicit flag in a later API.
 - The host enforces text length and channel existence.
@@ -414,12 +430,12 @@ Plugins can send pre-encoded Opus audio as bot users.
 Host API:
 
 ```cpp
-bool (*join_bot_voice)(PartiesBotId bot_id,
+bool (*join_bot_voice)(PartiesBotHandle bot,
                        PartiesChannelId voice_channel_id);
 
-bool (*leave_bot_voice)(PartiesBotId bot_id);
+bool (*leave_bot_voice)(PartiesBotHandle bot);
 
-bool (*send_bot_voice_packet)(PartiesBotId bot_id,
+bool (*send_bot_voice_packet)(PartiesBotHandle bot,
                               uint16_t sequence,
                               const uint8_t* opus_payload,
                               size_t opus_payload_len);
@@ -445,6 +461,8 @@ the Opus payload and sequence number; the host validates and forwards.
 Rules:
 
 - A bot must be in a voice channel before sending audio.
+- Multiple bots from the same plugin may be present in different voice channels,
+  or in the same voice channel if normal channel capacity allows it.
 - Audio is forwarded only to authenticated users in the bot's channel who are
   not deafened.
 - The host enforces the same max Opus packet size as normal client voice.
@@ -486,30 +504,31 @@ struct PartiesPluginHost {
                                  size_t command_count);
 
     bool (*create_bot_user)(void* context,
+                            const char* key,
                             const char* display_name,
-                            PartiesBotId* out_bot_id,
+                            PartiesBotHandle* out_bot,
                             PartiesUserId* out_user_id);
 
-    bool (*destroy_bot_user)(void* context, PartiesBotId bot_id);
+    bool (*destroy_bot_user)(void* context, PartiesBotHandle bot);
 
     bool (*set_bot_display_name)(void* context,
-                                 PartiesBotId bot_id,
+                                 PartiesBotHandle bot,
                                  const char* display_name);
 
     bool (*send_bot_chat)(void* context,
-                          PartiesBotId bot_id,
+                          PartiesBotHandle bot,
                           PartiesChannelId text_channel_id,
                           const char* text,
                           PartiesMessageId* out_message_id);
 
     bool (*join_bot_voice)(void* context,
-                           PartiesBotId bot_id,
+                           PartiesBotHandle bot,
                            PartiesChannelId voice_channel_id);
 
-    bool (*leave_bot_voice)(void* context, PartiesBotId bot_id);
+    bool (*leave_bot_voice)(void* context, PartiesBotHandle bot);
 
     bool (*send_bot_voice_packet)(void* context,
-                                  PartiesBotId bot_id,
+                                  PartiesBotHandle bot,
                                   uint16_t sequence,
                                   const uint8_t* opus_payload,
                                   size_t opus_payload_len);
@@ -534,7 +553,9 @@ Recommended v1 permissions:
 | `send_bot_audio` | Send Opus packets as bot users |
 
 The plugin manifest declares requested permissions. Server config grants the
-subset allowed by the operator.
+subset allowed by the operator. Loading is default-deny: a plugin id must appear
+in `[[plugins.allow]]`, and effective permissions are the intersection of the
+manifest request and the server grant.
 
 ## 15. Registration and Hooks
 

@@ -213,6 +213,14 @@ int main() {
     cfg.key_file       = key_path;
     cfg.db_path        = db_path;
     cfg.max_clients    = 8;
+    cfg.plugins.enabled = true;
+    cfg.plugins.directory = PARTIES_TEST_PLUGIN_DIR;
+    cfg.plugins.allow.push_back(PluginConfig::Allow{
+        "parties.example.bot_echo",
+        true,
+        {"create_chat_commands", "create_bot_users", "send_bot_chat",
+         "join_bot_voice", "send_bot_audio"}
+    });
 
     Server server;
     TEST_ASSERT(server.start(cfg), "server start");
@@ -254,6 +262,7 @@ int main() {
     LOG("[3/15] Client A connected\n");
 
     uint32_t user_a_id = 0;
+    uint32_t plugin_bot_user_id = 0;
     {
         auto now = static_cast<uint64_t>(std::time(nullptr));
 
@@ -284,6 +293,24 @@ int main() {
         BinaryReader r(payload.data(), payload.size());
         user_a_id = r.read_u32();
         TEST_ASSERT(user_a_id > 0, "client A user_id > 0");
+
+        std::vector<uint8_t> command_payload;
+        TEST_ASSERT(wait_for_message(client_a, ControlMessageType::CHAT_COMMAND_LIST, command_payload),
+                    "client A chat command list");
+        BinaryReader cr(command_payload.data(), command_payload.size());
+        uint16_t command_count = cr.read_u16();
+        bool found_botping = false;
+        for (uint16_t i = 0; i < command_count; ++i) {
+            std::string name = cr.read_string();
+            std::string description = cr.read_string();
+            std::string usage = cr.read_string();
+            (void)description;
+            (void)usage;
+            if (name == "botping")
+                found_botping = true;
+        }
+        TEST_ASSERT(!cr.error(), "client A command list parse");
+        TEST_ASSERT(found_botping, "botping command advertised");
 
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         drain_messages(client_a);
@@ -341,6 +368,77 @@ int main() {
     }
     LOG("[4/15] Client B authenticated (user_id=%u)\n", user_b_id);
 
+    // ── Plugin command: /botping should create/reuse a bot and send bot chat ──
+    LOG("[plugin] Testing /botping command...\n");
+    {
+        BinaryWriter w;
+        w.write_u32(1); // text channel id
+        w.write_string("/botping hello from plugin test");
+        w.write_u8(0); // attachments
+        TEST_ASSERT(client_a.send_message(ControlMessageType::CHAT_SEND,
+                    w.data().data(), w.data().size()), "client A send /botping");
+
+        std::vector<uint8_t> payload;
+        TEST_ASSERT(wait_for_message(client_a, ControlMessageType::CHAT_MESSAGE, payload),
+                    "client A receives bot chat");
+
+        BinaryReader r(payload.data(), payload.size());
+        uint64_t msg_id = r.read_u64();
+        uint32_t channel_id = r.read_u32();
+        uint32_t sender_id = r.read_u32();
+        std::string sender_name = r.read_string();
+        uint64_t timestamp = r.read_u64();
+        std::string text = r.read_string();
+        uint8_t pinned = r.read_u8();
+        uint8_t attachment_count = r.read_u8();
+
+        TEST_ASSERT(!r.error(), "bot chat parse");
+        TEST_ASSERT(msg_id > 0, "bot chat message id");
+        TEST_ASSERT(channel_id == 1, "bot chat channel id");
+        TEST_ASSERT(sender_id != 0 && sender_id != user_a_id && sender_id != user_b_id,
+                    "bot chat sender id is bot");
+        plugin_bot_user_id = sender_id;
+        TEST_ASSERT(sender_name == "Bot Echo", "bot chat sender name");
+        TEST_ASSERT(timestamp > 0, "bot chat timestamp");
+        TEST_ASSERT(text == "hello from plugin test", "bot chat text");
+        TEST_ASSERT(pinned == 0, "bot chat not pinned");
+        TEST_ASSERT(attachment_count == 0, "bot chat no attachments");
+    }
+    LOG("[plugin] /botping produced bot chat\n");
+
+    LOG("[plugin] Testing bot user reuse after handle reset...\n");
+    {
+        BinaryWriter reset;
+        reset.write_u32(1);
+        reset.write_string("/botreset");
+        reset.write_u8(0);
+        TEST_ASSERT(client_a.send_message(ControlMessageType::CHAT_SEND,
+                    reset.data().data(), reset.data().size()), "client A send /botreset");
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+        BinaryWriter ping;
+        ping.write_u32(1);
+        ping.write_string("/botping reused");
+        ping.write_u8(0);
+        TEST_ASSERT(client_a.send_message(ControlMessageType::CHAT_SEND,
+                    ping.data().data(), ping.data().size()), "client A send second /botping");
+
+        std::vector<uint8_t> payload;
+        TEST_ASSERT(wait_for_message(client_a, ControlMessageType::CHAT_MESSAGE, payload),
+                    "client A receives reused bot chat");
+
+        BinaryReader r(payload.data(), payload.size());
+        (void)r.read_u64();
+        TEST_ASSERT(r.read_u32() == 1, "reused bot chat channel id");
+        uint32_t sender_id = r.read_u32();
+        TEST_ASSERT(sender_id == plugin_bot_user_id, "bot user id reused");
+        TEST_ASSERT(r.read_string() == "Bot Echo", "reused bot sender name");
+        (void)r.read_u64();
+        TEST_ASSERT(r.read_string() == "reused", "reused bot chat text");
+        TEST_ASSERT(!r.error(), "reused bot chat parse");
+    }
+    LOG("[plugin] Bot user reuse verified (user_id=%u)\n", plugin_bot_user_id);
+
     // ── Both join channel 1 ──
     LOG("[5/15] Joining channel...\n");
     {
@@ -377,6 +475,77 @@ int main() {
 
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     drain_messages(client_a);
+
+    LOG("[plugin] Testing bot voice join/audio/leave...\n");
+    {
+        BinaryWriter join;
+        join.write_u32(1);
+        join.write_string("/botjoin");
+        join.write_u8(0);
+        TEST_ASSERT(client_a.send_message(ControlMessageType::CHAT_SEND,
+                    join.data().data(), join.data().size()), "client A send /botjoin");
+
+        std::vector<uint8_t> payload;
+        TEST_ASSERT(wait_for_message(client_b, ControlMessageType::USER_JOINED_CHANNEL, payload),
+                    "client B receives bot joined channel");
+        BinaryReader jr(payload.data(), payload.size());
+        TEST_ASSERT(jr.read_u32() == plugin_bot_user_id, "bot join user id");
+        TEST_ASSERT(jr.read_string() == "Bot Echo", "bot join display name");
+        TEST_ASSERT(jr.read_u32() == 1, "bot join channel id");
+        TEST_ASSERT(jr.read_u8() == static_cast<uint8_t>(Role::User), "bot join role");
+        TEST_ASSERT(!jr.error(), "bot join parse");
+
+        {
+            std::lock_guard<std::mutex> lock(voice_mutex);
+            received_voice.clear();
+        }
+        voice_received = false;
+
+        BinaryWriter voice;
+        voice.write_u32(1);
+        voice.write_string("/botvoice");
+        voice.write_u8(0);
+        TEST_ASSERT(client_a.send_message(ControlMessageType::CHAT_SEND,
+                    voice.data().data(), voice.data().size()), "client A send /botvoice");
+
+        auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(TIMEOUT_MS);
+        while (!voice_received && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        TEST_ASSERT(voice_received.load(), "client B received bot voice data");
+        {
+            std::lock_guard<std::mutex> lock(voice_mutex);
+            TEST_ASSERT(received_voice.size() == 10, "bot voice packet size");
+            TEST_ASSERT(received_voice[0] == VOICE_PACKET_TYPE, "bot voice packet type");
+            uint32_t sender_id = 0;
+            std::memcpy(&sender_id, received_voice.data() + 1, 4);
+            TEST_ASSERT(sender_id == plugin_bot_user_id, "bot voice sender id");
+            uint16_t seq = 0;
+            std::memcpy(&seq, received_voice.data() + 5, 2);
+            TEST_ASSERT(seq == 0, "bot voice sequence");
+            TEST_ASSERT(received_voice[7] == 0xf8 &&
+                        received_voice[8] == 0xff &&
+                        received_voice[9] == 0xfe, "bot voice payload");
+            received_voice.clear();
+        }
+        voice_received = false;
+
+        BinaryWriter leave;
+        leave.write_u32(1);
+        leave.write_string("/botleave");
+        leave.write_u8(0);
+        TEST_ASSERT(client_a.send_message(ControlMessageType::CHAT_SEND,
+                    leave.data().data(), leave.data().size()), "client A send /botleave");
+
+        TEST_ASSERT(wait_for_message(client_b, ControlMessageType::USER_LEFT_CHANNEL, payload),
+                    "client B receives bot left channel");
+        BinaryReader lr(payload.data(), payload.size());
+        TEST_ASSERT(lr.read_u32() == plugin_bot_user_id, "bot leave user id");
+        TEST_ASSERT(lr.read_u32() == 1, "bot leave channel id");
+        TEST_ASSERT(!lr.error(), "bot leave parse");
+    }
+    LOG("[plugin] Bot voice join/audio/leave verified\n");
 
     // ── Client A: encode PCM silence and send as voice ──
     LOG("[7/15] Sending voice data...\n");
