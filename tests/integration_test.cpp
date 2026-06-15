@@ -509,7 +509,7 @@ int main() {
         TEST_ASSERT(jr.read_u32() == plugin_bot_user_id, "bot join user id");
         TEST_ASSERT(jr.read_string() == "Bot Echo", "bot join display name");
         TEST_ASSERT(jr.read_u32() == 1, "bot join channel id");
-        TEST_ASSERT(jr.read_u8() == static_cast<uint8_t>(Role::User), "bot join role");
+        TEST_ASSERT(jr.read_u8() == static_cast<uint8_t>(Role::Bot), "bot join role");
         TEST_ASSERT(!jr.error(), "bot join parse");
 
         {

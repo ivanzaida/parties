@@ -480,6 +480,8 @@ std::optional<UserId> Server::create_plugin_bot_user(std::string_view plugin_id,
     if (auto existing = db_.get_bot_user(std::string(plugin_id), std::string(key))) {
         if (existing->display_name != display_name)
             db_.update_display_name(existing->id, std::string(display_name));
+        if (existing->role != static_cast<int>(Role::Bot))
+            db_.set_user_role(existing->id, Role::Bot);
         LOG_INFO("Reusing bot user '{}' (key='{}') for plugin '{}' (user_id={})",
                  display_name, key, plugin_id, existing->id);
         return existing->id;
@@ -498,6 +500,8 @@ std::optional<UserId> Server::create_plugin_bot_user(std::string_view plugin_id,
     if (auto existing = db_.get_user_by_pubkey(public_key)) {
         if (existing->display_name != display_name)
             db_.update_display_name(existing->id, std::string(display_name));
+        if (existing->role != static_cast<int>(Role::Bot))
+            db_.set_user_role(existing->id, Role::Bot);
         LOG_INFO("Reusing bot user '{}' (key='{}') for plugin '{}' (user_id={})",
                  display_name, key, plugin_id, existing->id);
         return existing->id;
@@ -509,8 +513,10 @@ std::optional<UserId> Server::create_plugin_bot_user(std::string_view plugin_id,
     fingerprint += public_key_fingerprint(public_key);
 
     if (!db_.create_bot_user(public_key, std::string(display_name), fingerprint,
-                             std::string(plugin_id), std::string(key), Role::User)) {
+                             std::string(plugin_id), std::string(key), Role::Bot)) {
         if (auto existing = db_.get_bot_user(std::string(plugin_id), std::string(key))) {
+            if (existing->role != static_cast<int>(Role::Bot))
+                db_.set_user_role(existing->id, Role::Bot);
             LOG_INFO("Reusing bot user '{}' (key='{}') for plugin '{}' (user_id={})",
                      display_name, key, plugin_id, existing->id);
             return existing->id;
@@ -588,7 +594,7 @@ bool Server::join_plugin_bot_voice(UserId user_id,
     writer.write_u32(user_id);
     writer.write_string(std::string(display_name));
     writer.write_u32(voice_channel_id);
-    writer.write_u8(static_cast<uint8_t>(Role::User));
+    writer.write_u8(static_cast<uint8_t>(Role::Bot));
 
     auto all = quic_.get_sessions();
     for (auto& s : all) {
@@ -943,7 +949,7 @@ void Server::handle_message(const IncomingMessage& msg) {
                 for (const auto& bot : bots) {
                     list_writer.write_u32(bot.user_id);
                     list_writer.write_string(bot.display_name);
-                    list_writer.write_u8(static_cast<uint8_t>(Role::User));
+                    list_writer.write_u8(static_cast<uint8_t>(Role::Bot));
                     list_writer.write_u8(0);
                     list_writer.write_u8(0);
                 }
@@ -1050,7 +1056,7 @@ void Server::handle_message(const IncomingMessage& msg) {
             for (const auto& bot : bots) {
                 list_writer.write_u32(bot.user_id);
                 list_writer.write_string(bot.display_name);
-                list_writer.write_u8(static_cast<uint8_t>(Role::User));
+                list_writer.write_u8(static_cast<uint8_t>(Role::Bot));
                 list_writer.write_u8(0);
                 list_writer.write_u8(0);
             }
@@ -1300,9 +1306,13 @@ void Server::handle_message(const IncomingMessage& msg) {
 
         Role target_new_role = static_cast<Role>(new_role);
 
-        // Owner role is assigned only via server config — never through API
+        // Owner role is assigned only via server config; Bot only via plugin bot creation.
         if (target_new_role == Role::Owner) {
             send_error(msg.session_id, "Owner role can only be set in server config");
+            break;
+        }
+        if (target_new_role == Role::Bot) {
+            send_error(msg.session_id, "Bot role can only be assigned to plugin bots");
             break;
         }
 

@@ -1715,8 +1715,9 @@ void AppCore::setup_model_callbacks()
         model_.menu_user_id            = user_id;
         model_.menu_user_name          = name;
         model_.menu_user_role          = user_role;
-        model_.menu_can_roles          = model_.can_manage_roles && role_ <= user_role;
-        model_.menu_can_kick           = model_.can_kick && role_ <= user_role;
+        const bool is_bot = user_role == static_cast<int>(parties::Role::Bot);
+        model_.menu_can_roles          = model_.can_manage_roles && role_ <= user_role && !is_bot;
+        model_.menu_can_kick           = model_.can_kick && role_ <= user_role && !is_bot;
         model_.menu_user_volume        = mixer_.get_user_volume(static_cast<UserId>(user_id));
         model_.menu_user_compress      = mixer_.get_user_compression(static_cast<UserId>(user_id));
         model_.menu_user_compress_target = mixer_.get_user_compression_target(static_cast<UserId>(user_id));

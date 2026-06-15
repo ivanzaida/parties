@@ -72,7 +72,7 @@ public:
                      const std::string& fingerprint, Role role = Role::User);
     bool create_bot_user(const PublicKey& pubkey, const std::string& display_name,
                          const std::string& fingerprint, const std::string& owner_plugin,
-                         const std::string& bot_key, Role role = Role::User);
+                         const std::string& bot_key, Role role = Role::Bot);
     std::optional<UserRow> get_user_by_pubkey(const PublicKey& pubkey);
     std::optional<UserRow> get_bot_user(const std::string& owner_plugin,
                                         const std::string& bot_key);
