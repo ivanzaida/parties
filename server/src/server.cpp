@@ -1671,6 +1671,7 @@ void Server::handle_message(const IncomingMessage& msg) {
 
             std::string command_error;
             if (plugins_.dispatch_chat_command(msg.session_id, session->user_id, channel_id,
+                                               static_cast<uint8_t>(session->role),
                                                command_name, args, text, &command_error)) {
                 if (!command_error.empty())
                     send_error(msg.session_id, command_error);

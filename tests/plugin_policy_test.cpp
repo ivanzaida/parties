@@ -3,6 +3,8 @@
 #include <cstdlib>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
+#include <string>
 
 namespace fs = std::filesystem;
 using namespace parties::server;
@@ -20,6 +22,15 @@ static bool has_command(const PluginManager& plugins, const char* name) {
             return true;
     }
     return false;
+}
+
+static size_t command_count(const PluginManager& plugins) {
+    return plugins.chat_commands().size();
+}
+
+static void write_text(const fs::path& path, const std::string& text) {
+    std::ofstream out(path);
+    out << text;
 }
 
 int main() {
@@ -91,6 +102,49 @@ int main() {
         });
         TEST_ASSERT(plugins.load(cfg), "load disabled allow entry");
         TEST_ASSERT(plugins.chat_commands().empty(), "disabled allow entry skips plugin");
+    }
+
+    {
+        fs::path duplicate = tmp / "plugins" / "bot_echo_duplicate";
+        fs::copy(source, duplicate, fs::copy_options::recursive | fs::copy_options::overwrite_existing);
+
+        PluginManager plugins;
+        PluginConfig cfg;
+        cfg.enabled = true;
+        cfg.directory = (tmp / "plugins").string();
+        cfg.allow.push_back(PluginConfig::Allow{
+            "parties.example.bot_echo",
+            true,
+            {"create_chat_commands"}
+        });
+        TEST_ASSERT(plugins.load(cfg), "load duplicate plugin ids");
+        TEST_ASSERT(command_count(plugins) == 8, "duplicate plugin id is rejected after first load");
+        fs::remove_all(duplicate);
+    }
+
+    {
+        fs::path bad = tmp / "plugins" / "bad_library_path";
+        fs::create_directories(bad);
+        write_text(bad / "plugin.toml",
+            "id = \"parties.bad_library_path\"\n"
+            "name = \"Bad Library Path\"\n"
+            "version = \"0.1.0\"\n"
+            "api_version = \"1.0\"\n"
+            "library = \"..\\\\evil.dll\"\n"
+            "permissions = [\"create_chat_commands\"]\n");
+
+        PluginManager plugins;
+        PluginConfig cfg;
+        cfg.enabled = true;
+        cfg.directory = (bad.parent_path()).string();
+        cfg.allow.push_back(PluginConfig::Allow{
+            "parties.bad_library_path",
+            true,
+            {"create_chat_commands"}
+        });
+        TEST_ASSERT(plugins.load(cfg), "load manifest with invalid library path");
+        TEST_ASSERT(plugins.chat_commands().empty(), "invalid library path skips plugin");
+        fs::remove_all(bad);
     }
 
     fs::remove_all(tmp);

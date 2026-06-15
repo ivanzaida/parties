@@ -5,13 +5,19 @@
 #include <toml.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <chrono>
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
+#include <fstream>
 #include <limits>
 #include <map>
+#include <sstream>
+
+#include <openssl/sha.h>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -91,8 +97,80 @@ struct PluginManager::Plugin {
     plugin::Registration registration{};
     plugin::ShutdownFn shutdown = nullptr;
     std::vector<std::unique_ptr<Bot>> bots;
+    std::unordered_set<Bot*> bot_handles;
     std::string last_error;
+    bool disabled = false;
 };
+
+namespace {
+
+constexpr size_t MAX_LIVE_BOTS_PER_PLUGIN = 64;
+constexpr auto PLUGIN_CALLBACK_WARN_AFTER = std::chrono::milliseconds(250);
+
+template <typename T>
+bool valid_abi_header(const plugin::AbiHeader& abi) {
+    return abi.api_major == plugin::API_VERSION_MAJOR &&
+           abi.size >= sizeof(plugin::AbiHeader);
+}
+
+template <typename T>
+bool copy_abi_out(T* out, const T& value) {
+    if (!out)
+        return false;
+    const auto requested = out->abi;
+    if (!valid_abi_header<T>(requested))
+        return false;
+    std::memcpy(out, &value, std::min<size_t>(requested.size, sizeof(T)));
+    return true;
+}
+
+bool command_def_has_min_role(const plugin::CommandDefinition& command) {
+    return command.abi.size >=
+        offsetof(plugin::CommandDefinition, min_role) + sizeof(command.min_role);
+}
+
+std::string normalize_sha256(std::string value) {
+    value.erase(std::remove_if(value.begin(), value.end(), [](unsigned char c) {
+        return c == ':' || c == '-' || std::isspace(c);
+    }), value.end());
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return value;
+}
+
+std::optional<std::string> file_sha256_hex(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
+        return std::nullopt;
+
+    SHA256_CTX ctx;
+    SHA256_Init(&ctx);
+
+    std::array<char, 8192> buffer{};
+    while (in) {
+        in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        const auto read = in.gcount();
+        if (read > 0) {
+            SHA256_Update(&ctx, reinterpret_cast<const unsigned char*>(buffer.data()),
+                          static_cast<size_t>(read));
+        }
+    }
+
+    unsigned char digest[SHA256_DIGEST_LENGTH];
+    SHA256_Final(digest, &ctx);
+
+    std::ostringstream out;
+    out << std::hex;
+    for (unsigned char byte : digest) {
+        out.width(2);
+        out.fill('0');
+        out << static_cast<int>(byte);
+    }
+    return out.str();
+}
+
+} // namespace
 
 PluginManager::PluginManager() = default;
 
@@ -107,6 +185,49 @@ void PluginManager::set_host_services(HostServices services) {
 std::vector<PluginManager::ChatCommand> PluginManager::chat_commands() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return chat_commands_;
+}
+
+void PluginManager::disable_plugin(Plugin& plugin, std::string_view reason) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (plugin.disabled)
+        return;
+    plugin.disabled = true;
+    plugin.last_error = std::string(reason);
+    for (auto& bot : plugin.bots) {
+        bot->destroyed = true;
+        bot->voice_channel_id = 0;
+    }
+    reap_destroyed_bots(plugin);
+    chat_commands_.erase(std::remove_if(chat_commands_.begin(), chat_commands_.end(),
+        [&](const ChatCommand& command) { return command.plugin_id == plugin.id; }),
+        chat_commands_.end());
+    LOG_ERROR("Plugin '{}' disabled: {}", plugin.id, reason);
+}
+
+template <typename Fn>
+bool PluginManager::invoke_plugin_callback(Plugin& plugin, const char* callback_name, Fn&& fn) {
+    if (plugin.disabled)
+        return false;
+
+    const auto started = std::chrono::steady_clock::now();
+    try {
+        fn();
+    } catch (const std::exception& e) {
+        disable_plugin(plugin, std::string(callback_name) + " threw exception: " + e.what());
+        return false;
+    } catch (...) {
+        disable_plugin(plugin, std::string(callback_name) + " threw unknown exception");
+        return false;
+    }
+
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    if (elapsed > PLUGIN_CALLBACK_WARN_AFTER) {
+        LOG_WARN("Plugin '{}' callback '{}' took {} ms",
+                 plugin.id,
+                 callback_name,
+                 std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());
+    }
+    return true;
 }
 
 static bool valid_command_name(std::string_view name) {
@@ -651,10 +772,20 @@ bool PluginManager::load(const PluginConfig& cfg) {
 void PluginManager::shutdown() {
     for (auto it = plugins_.rbegin(); it != plugins_.rend(); ++it) {
         Plugin& plugin = **it;
-        if (plugin.registration.on_server_stopping)
-            plugin.registration.on_server_stopping();
-        if (plugin.shutdown)
-            plugin.shutdown();
+        if (plugin.registration.on_server_stopping) {
+            invoke_plugin_callback(plugin, "on_server_stopping", [&]() {
+                plugin.registration.on_server_stopping();
+            });
+        }
+        if (plugin.shutdown) {
+            try {
+                plugin.shutdown();
+            } catch (const std::exception& e) {
+                LOG_ERROR("Plugin '{}' shutdown threw exception: {}", plugin.id, e.what());
+            } catch (...) {
+                LOG_ERROR("Plugin '{}' shutdown threw unknown exception", plugin.id);
+            }
+        }
     }
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -681,6 +812,7 @@ bool PluginManager::load_manifest(const std::filesystem::path& manifest_path) {
     plugin->version = toml::find_or(manifest, "version", std::string{});
     std::string api_version = toml::find_or(manifest, "api_version", std::string{});
     std::string library = toml::find_or(manifest, "library", std::string{});
+    std::string expected_sha256 = toml::find_or(manifest, "sha256", std::string{});
 
     if (plugin->id.empty() || library.empty()) {
         LOG_WARN("Plugin manifest '{}' is missing id or library", manifest_path.string());
@@ -689,6 +821,18 @@ bool PluginManager::load_manifest(const std::filesystem::path& manifest_path) {
     if (api_version != "1.0") {
         LOG_WARN("Plugin '{}' has unsupported api_version '{}'", plugin->id, api_version);
         return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto duplicate = std::find_if(plugins_.begin(), plugins_.end(),
+            [&](const auto& loaded) { return loaded->id == plugin->id; });
+        if (duplicate != plugins_.end()) {
+            LOG_WARN("Plugin '{}' from '{}' rejected: duplicate plugin id already loaded from '{}'",
+                     plugin->id,
+                     manifest_path.string(),
+                     (*duplicate)->manifest_path.string());
+            return false;
+        }
     }
 
     auto grant_it = grants_.find(plugin->id);
@@ -726,7 +870,32 @@ bool PluginManager::load_manifest(const std::filesystem::path& manifest_path) {
         });
     }
 
-    plugin->library_path = manifest_path.parent_path() / library;
+    std::filesystem::path library_name(library);
+    if (library_name.is_absolute() ||
+        library_name.has_root_name() ||
+        library_name.has_root_directory() ||
+        library_name.has_parent_path() ||
+        library_name.filename() != library_name ||
+        library_name.filename() == "." ||
+        library_name.filename() == "..") {
+        LOG_WARN("Plugin '{}' has invalid library path '{}'; expected a bare filename next to plugin.toml",
+                 plugin->id, library);
+        return false;
+    }
+
+    plugin->library_path = manifest_path.parent_path() / library_name.filename();
+    if (!expected_sha256.empty()) {
+        auto actual_sha256 = file_sha256_hex(plugin->library_path);
+        if (!actual_sha256) {
+            LOG_WARN("Plugin '{}' could not hash library '{}'", plugin->id, plugin->library_path.string());
+            return false;
+        }
+        if (normalize_sha256(expected_sha256) != *actual_sha256) {
+            LOG_WARN("Plugin '{}' library hash mismatch for '{}'", plugin->id, plugin->library_path.string());
+            return false;
+        }
+    }
+
     if (!plugin->library.open(plugin->library_path)) {
         LOG_WARN("Failed to load plugin '{}' from '{}'", plugin->id, plugin->library_path.string());
         return false;
@@ -773,7 +942,25 @@ bool PluginManager::load_manifest(const std::filesystem::path& manifest_path) {
         std::lock_guard<std::mutex> lock(mutex_);
         commands_before_init = chat_commands_.size();
     }
-    if (!init(&host, &plugin->registration)) {
+    bool init_ok = false;
+    try {
+        init_ok = init(&host, &plugin->registration);
+    } catch (const std::exception& e) {
+        LOG_WARN("Plugin '{}' init threw exception: {} (manifest='{}', library='{}')",
+                 plugin->id,
+                 e.what(),
+                 plugin->manifest_path.string(),
+                 plugin->library_path.string());
+        init_ok = false;
+    } catch (...) {
+        LOG_WARN("Plugin '{}' init threw unknown exception (manifest='{}', library='{}')",
+                 plugin->id,
+                 plugin->manifest_path.string(),
+                 plugin->library_path.string());
+        init_ok = false;
+    }
+
+    if (!init_ok) {
         std::string last_error;
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -796,6 +983,20 @@ bool PluginManager::load_manifest(const std::filesystem::path& manifest_path) {
         return false;
     }
 
+    if (plugin->registration.abi.api_major != plugin::API_VERSION_MAJOR ||
+        plugin->registration.abi.size != sizeof(plugin::Registration)) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        chat_commands_.resize(commands_before_init);
+        LOG_WARN("Plugin '{}' returned incompatible registration ABI "
+                 "(size={}, major={}, expected size={}, major={})",
+                 plugin->id,
+                 plugin->registration.abi.size,
+                 plugin->registration.abi.api_major,
+                 sizeof(plugin::Registration),
+                 plugin::API_VERSION_MAJOR);
+        return false;
+    }
+
     LOG_INFO("Loaded plugin '{}' ({})", plugin->id, plugin->name);
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -806,22 +1007,31 @@ bool PluginManager::load_manifest(const std::filesystem::path& manifest_path) {
 
 void PluginManager::on_server_started() {
     for (auto& plugin : plugins_) {
-        if (plugin->registration.on_server_started)
-            plugin->registration.on_server_started();
+        if (plugin->registration.on_server_started) {
+            invoke_plugin_callback(*plugin, "on_server_started", [&]() {
+                plugin->registration.on_server_started();
+            });
+        }
     }
 }
 
 void PluginManager::on_server_stopping() {
     for (auto& plugin : plugins_) {
-        if (plugin->registration.on_server_stopping)
-            plugin->registration.on_server_stopping();
+        if (plugin->registration.on_server_stopping) {
+            invoke_plugin_callback(*plugin, "on_server_stopping", [&]() {
+                plugin->registration.on_server_stopping();
+            });
+        }
     }
 }
 
 void PluginManager::on_session_authenticated(plugin::SessionId session) {
     for (auto& plugin : plugins_) {
-        if (plugin->registration.on_session_authenticated)
-            plugin->registration.on_session_authenticated(session);
+        if (plugin->registration.on_session_authenticated) {
+            invoke_plugin_callback(*plugin, "on_session_authenticated", [&]() {
+                plugin->registration.on_session_authenticated(session);
+            });
+        }
     }
 }
 
@@ -829,8 +1039,11 @@ void PluginManager::on_session_disconnected(plugin::SessionId session,
                                             plugin::UserId user_id,
                                             plugin::ChannelId voice_channel_id) {
     for (auto& plugin : plugins_) {
-        if (plugin->registration.on_session_disconnected)
-            plugin->registration.on_session_disconnected(session, user_id, voice_channel_id);
+        if (plugin->registration.on_session_disconnected) {
+            invoke_plugin_callback(*plugin, "on_session_disconnected", [&]() {
+                plugin->registration.on_session_disconnected(session, user_id, voice_channel_id);
+            });
+        }
     }
 }
 
@@ -879,6 +1092,7 @@ void PluginManager::clear_bot_voice_channel(plugin::ChannelId channel_id) {
 bool PluginManager::dispatch_chat_command(plugin::SessionId session,
                                           plugin::UserId user_id,
                                           plugin::ChannelId text_channel_id,
+                                          uint8_t caller_role,
                                           std::string_view command_name,
                                           std::string_view args,
                                           std::string_view raw_text,
@@ -905,6 +1119,14 @@ bool PluginManager::dispatch_chat_command(plugin::SessionId session,
     }
     if (!owner)
         return false;
+    if (owner->disabled)
+        return true;
+
+    if (caller_role > command_copy.min_role) {
+        if (error_message)
+            *error_message = "Permission denied";
+        return true;
+    }
 
     if (!owner->registration.on_chat_command) {
         LOG_WARN("Plugin '{}' owns command '{}' but has no on_chat_command callback",
@@ -930,13 +1152,16 @@ bool PluginManager::dispatch_chat_command(plugin::SessionId session,
     invocation.session_id = session;
     invocation.user_id = user_id;
     invocation.text_channel_id = text_channel_id;
+    invocation.caller_role = caller_role;
     invocation.command_name = command_name_copy.c_str();
     invocation.args = args_copy.c_str();
     invocation.raw_text = raw_text_copy.c_str();
     invocation.parsed_args = parsed_args.empty() ? nullptr : parsed_args.data();
     invocation.parsed_arg_count = parsed_args.size();
 
-    owner->registration.on_chat_command(&invocation);
+    invoke_plugin_callback(*owner, "on_chat_command", [&]() {
+        owner->registration.on_chat_command(&invocation);
+    });
     return true;
 }
 
@@ -951,6 +1176,8 @@ PluginManager::ChatResult PluginManager::process_chat_message(
 
     for (auto& owner : plugins_) {
         Plugin& plugin = *owner;
+        if (plugin.disabled)
+            continue;
         if (!plugin.registration.on_chat_message)
             continue;
         if (!has_permission(plugin, "read_chat") && !has_permission(plugin, "moderate_chat"))
@@ -970,7 +1197,11 @@ PluginManager::ChatResult PluginManager::process_chat_message(
         decision.abi = plugin::make_abi_header<plugin::ChatDecision>();
         decision.code = static_cast<uint8_t>(plugin::ChatDecisionCode::Continue);
 
-        plugin.registration.on_chat_message(&message, &decision);
+        if (!invoke_plugin_callback(plugin, "on_chat_message", [&]() {
+                plugin.registration.on_chat_message(&message, &decision);
+            })) {
+            continue;
+        }
 
         auto code = static_cast<plugin::ChatDecisionCode>(decision.code);
         if (code == plugin::ChatDecisionCode::Continue)
@@ -1053,6 +1284,14 @@ bool PluginManager::host_create_bot_user(void* context,
         std::lock_guard<std::mutex> lock(manager->mutex_);
         if (!manager->check_host_permission(*plugin, "create_bot_users", "create bot users"))
             return false;
+        manager->reap_destroyed_bots(*plugin);
+        const auto live_count = std::count_if(plugin->bots.begin(), plugin->bots.end(),
+            [](const std::unique_ptr<Bot>& bot) { return !bot->destroyed; });
+        if (static_cast<size_t>(live_count) >= MAX_LIVE_BOTS_PER_PLUGIN) {
+            LOG_WARN("Plugin '{}' tried to exceed the live bot limit ({})",
+                     plugin->id, MAX_LIVE_BOTS_PER_PLUGIN);
+            return false;
+        }
         plugin_id = plugin->id;
     }
 
@@ -1084,6 +1323,7 @@ bool PluginManager::host_create_bot_user(void* context,
     plugin::BotHandle handle = static_cast<plugin::BotHandle>(bot.get());
     {
         std::lock_guard<std::mutex> lock(manager->mutex_);
+        plugin->bot_handles.insert(bot.get());
         plugin->bots.push_back(std::move(bot));
     }
 
@@ -1099,17 +1339,36 @@ bool PluginManager::host_destroy_bot_user(void* context, plugin::BotHandle bot_h
     if (!plugin || !plugin->manager) return false;
     auto* manager = plugin->manager;
 
-    std::lock_guard<std::mutex> lock(manager->mutex_);
-    if (!manager->check_host_permission(*plugin, "create_bot_users", "destroy bot users"))
-        return false;
+    plugin::UserId user_id = 0;
+    plugin::ChannelId voice_channel_id = 0;
+    std::string display_name;
+    std::string plugin_id;
+    {
+        std::lock_guard<std::mutex> lock(manager->mutex_);
+        if (!manager->check_host_permission(*plugin, "create_bot_users", "destroy bot users"))
+            return false;
 
-    Bot* bot = manager->get_owned_bot(*plugin, bot_handle);
-    if (!bot) return false;
+        Bot* bot = manager->get_owned_bot(*plugin, bot_handle);
+        if (!bot) return false;
+        user_id = bot->user_id;
+        voice_channel_id = bot->voice_channel_id;
+        display_name = bot->display_name;
+        plugin_id = plugin->id;
+    }
 
-    bot->destroyed = true;
-    bot->voice_channel_id = 0;
+    if (voice_channel_id != 0 && manager->services_.leave_bot_voice)
+        manager->services_.leave_bot_voice(user_id, display_name, voice_channel_id);
+
+    {
+        std::lock_guard<std::mutex> lock(manager->mutex_);
+        Bot* bot = manager->get_owned_bot(*plugin, bot_handle);
+        if (!bot) return false;
+        bot->destroyed = true;
+        bot->voice_channel_id = 0;
+        manager->reap_destroyed_bots(*plugin);
+    }
     LOG_INFO("Plugin '{}' destroyed bot user '{}' (user_id={})",
-             plugin->id, bot->display_name, bot->user_id);
+             plugin_id, display_name, user_id);
     return true;
 }
 
@@ -1366,8 +1625,10 @@ static bool copy_channel_list(const std::vector<plugin::ChannelInfo>& channels,
         return true;
 
     const size_t to_copy = capacity < channels.size() ? capacity : channels.size();
-    for (size_t i = 0; i < to_copy; ++i)
-        out_channels[i] = channels[i];
+    for (size_t i = 0; i < to_copy; ++i) {
+        if (!copy_abi_out(&out_channels[i], channels[i]))
+            return false;
+    }
 
     return capacity >= channels.size();
 }
@@ -1375,9 +1636,6 @@ static bool copy_channel_list(const std::vector<plugin::ChannelInfo>& channels,
 bool PluginManager::host_get_session_info(void* context,
                                           plugin::SessionId session,
                                           plugin::SessionInfo* out_info) {
-    if (out_info)
-        *out_info = {};
-
     auto* plugin = static_cast<Plugin*>(context);
     if (!plugin || !plugin->manager || !out_info || session == 0)
         return false;
@@ -1394,16 +1652,12 @@ bool PluginManager::host_get_session_info(void* context,
     if (!info)
         return false;
 
-    *out_info = *info;
-    return true;
+    return copy_abi_out(out_info, *info);
 }
 
 bool PluginManager::host_get_user_info(void* context,
                                        plugin::UserId user_id,
                                        plugin::UserInfo* out_info) {
-    if (out_info)
-        *out_info = {};
-
     auto* plugin = static_cast<Plugin*>(context);
     if (!plugin || !plugin->manager || !out_info || user_id == 0)
         return false;
@@ -1420,8 +1674,7 @@ bool PluginManager::host_get_user_info(void* context,
     if (!info)
         return false;
 
-    *out_info = *info;
-    return true;
+    return copy_abi_out(out_info, *info);
 }
 
 bool PluginManager::host_find_user_by_name(void* context,
@@ -1453,9 +1706,6 @@ bool PluginManager::host_find_user_by_name(void* context,
 bool PluginManager::host_get_voice_channel_info(void* context,
                                                 plugin::ChannelId channel_id,
                                                 plugin::ChannelInfo* out_info) {
-    if (out_info)
-        *out_info = {};
-
     auto* plugin = static_cast<Plugin*>(context);
     if (!plugin || !plugin->manager || !out_info || channel_id == 0)
         return false;
@@ -1472,16 +1722,12 @@ bool PluginManager::host_get_voice_channel_info(void* context,
     if (!info)
         return false;
 
-    *out_info = *info;
-    return true;
+    return copy_abi_out(out_info, *info);
 }
 
 bool PluginManager::host_get_text_channel_info(void* context,
                                                plugin::ChannelId channel_id,
                                                plugin::ChannelInfo* out_info) {
-    if (out_info)
-        *out_info = {};
-
     auto* plugin = static_cast<Plugin*>(context);
     if (!plugin || !plugin->manager || !out_info || channel_id == 0)
         return false;
@@ -1498,8 +1744,7 @@ bool PluginManager::host_get_text_channel_info(void* context,
     if (!info)
         return false;
 
-    *out_info = *info;
-    return true;
+    return copy_abi_out(out_info, *info);
 }
 
 bool PluginManager::host_list_voice_channels(void* context,
@@ -1606,7 +1851,9 @@ bool PluginManager::register_chat_commands(Plugin& plugin,
     bool all_ok = true;
     for (size_t i = 0; i < command_count; ++i) {
         const auto& cmd = commands[i];
-        if (!cmd.name || !cmd.description || !cmd.usage || !valid_command_name(cmd.name)) {
+        if (!valid_abi_header<plugin::CommandDefinition>(cmd.abi) ||
+            cmd.abi.size != sizeof(plugin::CommandDefinition) ||
+            !cmd.name || !cmd.description || !cmd.usage || !valid_command_name(cmd.name)) {
             LOG_WARN("Plugin '{}' provided invalid chat command at index {}", plugin.id, i);
             if (plugin.last_error.empty()) {
                 plugin.last_error = "invalid chat command at index " + std::to_string(i);
@@ -1641,6 +1888,7 @@ bool PluginManager::register_chat_commands(Plugin& plugin,
             cmd.name,
             cmd.description,
             cmd.usage,
+            command_def_has_min_role(cmd) ? cmd.min_role : uint8_t{3},
             std::move(*arguments),
         });
         LOG_INFO("Plugin '{}' registered chat command /{}", plugin.id, cmd.name);
@@ -1656,11 +1904,27 @@ PluginManager::Bot* PluginManager::get_owned_bot(Plugin& plugin, plugin::BotHand
     }
 
     auto* bot = static_cast<Bot*>(bot_handle);
+    if (plugin.bot_handles.find(bot) == plugin.bot_handles.end()) {
+        LOG_WARN("Plugin '{}' passed an invalid bot handle", plugin.id);
+        return nullptr;
+    }
     if (bot->owner != &plugin || bot->destroyed) {
         LOG_WARN("Plugin '{}' passed an invalid bot handle", plugin.id);
         return nullptr;
     }
     return bot;
+}
+
+void PluginManager::reap_destroyed_bots(Plugin& plugin) {
+    plugin.bots.erase(std::remove_if(plugin.bots.begin(), plugin.bots.end(),
+        [&](const std::unique_ptr<Bot>& bot) {
+            if (bot->destroyed && bot->voice_channel_id == 0) {
+                plugin.bot_handles.erase(bot.get());
+                return true;
+            }
+            return false;
+        }),
+        plugin.bots.end());
 }
 
 std::optional<plugin::ChannelId> PluginManager::bot_voice_channel(plugin::UserId user_id) const {
@@ -1677,6 +1941,10 @@ std::optional<plugin::ChannelId> PluginManager::bot_voice_channel(plugin::UserId
 bool PluginManager::check_host_permission(Plugin& plugin,
                                           std::string_view permission,
                                           std::string_view action) const {
+    if (plugin.disabled) {
+        LOG_WARN("Plugin '{}' tried to {} after it was disabled", plugin.id, action);
+        return false;
+    }
     if (has_permission(plugin, permission))
         return true;
 

@@ -66,6 +66,19 @@ const parties::plugin::CommandArgumentValue* find_arg(
     return nullptr;
 }
 
+template <typename T>
+T make_host_out() {
+    T value{};
+    value.abi = parties::plugin::make_abi_header<T>();
+    return value;
+}
+
+template <size_t N>
+void init_channel_outputs(parties::plugin::ChannelInfo (&channels)[N]) {
+    for (auto& channel : channels)
+        channel.abi = parties::plugin::make_abi_header<parties::plugin::ChannelInfo>();
+}
+
 void on_bottypes(const parties::plugin::ChatCommandInvocation* invocation) {
     if (!ensure_bot())
         return;
@@ -128,7 +141,7 @@ void on_botapi(const parties::plugin::ChatCommandInvocation* invocation) {
         return;
     }
 
-    parties::plugin::SessionInfo session{};
+    auto session = make_host_out<parties::plugin::SessionInfo>();
     if (!g_host.get_session_info ||
         !g_host.get_session_info(g_host.context, invocation->session_id, &session) ||
         session.user_id != invocation->user_id ||
@@ -138,7 +151,7 @@ void on_botapi(const parties::plugin::ChatCommandInvocation* invocation) {
         return;
     }
 
-    parties::plugin::UserInfo user{};
+    auto user = make_host_out<parties::plugin::UserInfo>();
     if (!g_host.get_user_info ||
         !g_host.get_user_info(g_host.context, invocation->user_id, &user) ||
         user.user_id != invocation->user_id ||
@@ -160,7 +173,7 @@ void on_botapi(const parties::plugin::ChatCommandInvocation* invocation) {
         return;
     }
 
-    parties::plugin::ChannelInfo voice_channel{};
+    auto voice_channel = make_host_out<parties::plugin::ChannelInfo>();
     if (!g_host.get_voice_channel_info ||
         !g_host.get_voice_channel_info(g_host.context, user_voice, &voice_channel) ||
         voice_channel.channel_id != user_voice ||
@@ -169,7 +182,7 @@ void on_botapi(const parties::plugin::ChatCommandInvocation* invocation) {
         return;
     }
 
-    parties::plugin::ChannelInfo text_channel{};
+    auto text_channel = make_host_out<parties::plugin::ChannelInfo>();
     if (!g_host.get_text_channel_info ||
         !g_host.get_text_channel_info(g_host.context, invocation->text_channel_id, &text_channel) ||
         text_channel.channel_id != invocation->text_channel_id ||
@@ -186,6 +199,7 @@ void on_botapi(const parties::plugin::ChatCommandInvocation* invocation) {
         return;
     }
     parties::plugin::ChannelInfo voice_channels[16]{};
+    init_channel_outputs(voice_channels);
     size_t voice_capacity = 16;
     if (!g_host.list_voice_channels(g_host.context, voice_channels, &voice_capacity) ||
         voice_capacity != voice_count) {
@@ -201,6 +215,7 @@ void on_botapi(const parties::plugin::ChatCommandInvocation* invocation) {
         return;
     }
     parties::plugin::ChannelInfo text_channels[16]{};
+    init_channel_outputs(text_channels);
     size_t text_capacity = 16;
     if (!g_host.list_text_channels(g_host.context, text_channels, &text_capacity) ||
         text_capacity != text_count) {

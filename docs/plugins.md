@@ -105,6 +105,8 @@ name = "Music Bot"
 version = "0.1.0"
 api_version = "1.0"
 library = "music_bot.dll"
+# Optional integrity pin for the library bytes, lowercase hex without colons.
+sha256 = "0123456789abcdef..."
 
 variables = {
   youtube_api_key = "env:YOUTUBE_API_KEY",
@@ -127,8 +129,12 @@ Rules:
 
 - `id` must match the server allow-list entry.
 - `api_version` must currently be `"1.0"`.
-- `library` is resolved relative to the manifest directory.
+- `library` must be a bare filename next to `plugin.toml`; absolute paths,
+  subdirectories, and `..` are rejected.
+- `sha256` is optional. When present, the server hashes the library before
+  loading it and rejects mismatches.
 - `variables` is optional. Keys and values must be strings.
+- Only one plugin with a given `id` may load.
 - Unsupported manifests are skipped; one bad plugin does not stop other plugins
   from loading.
 
@@ -170,7 +176,9 @@ and the plugin is not loaded.
 | `join_bot_voice` | Join, leave, and move bot users in voice channels. |
 | `send_bot_audio` | Send Opus packets as bot users. |
 
-Permissions are policy checks, not a sandbox.
+Permissions are policy checks between the host and a trusted plugin. They are
+not a sandbox or an RCE boundary against the plugin itself. The plugin directory,
+manifests, and libraries must be writable only by the server operator/principal.
 
 ## ABI Rules
 
@@ -195,6 +203,12 @@ Initialize ABI structs with:
 ```cpp
 parties::plugin::make_abi_header<T>()
 ```
+
+The host validates ABI headers on plugin registration and on host-call
+out-parameters. Before passing an output struct to the host, initialize its
+`abi` field. For arrays, initialize every element you provide. The host is the
+ABI authority: a major-version mismatch is rejected, and scalar out-parameters
+copy only the common prefix declared by the plugin-provided `abi.size`.
 
 Host function pointers are appended to `Host` over time. Plugins should check
 both the function pointer and `host->abi.size` before using a newer field when
@@ -353,7 +367,9 @@ with the same key reuses the existing persisted synthetic user row. Bot users
 are stored in `users` with `is_bot`, `bot_owner_plugin`, and `bot_key` metadata.
 
 Destroying a bot invalidates the runtime `BotHandle`, but it does not delete the
-persisted user row.
+persisted user row. Destroying a bot that is in voice broadcasts the normal
+voice leave event before the handle is invalidated. Destroyed runtime handles
+are reaped, and each plugin is limited to 64 live bot handles.
 
 ### Bot Chat
 
@@ -481,6 +497,8 @@ size_t count = 0;
 host->list_voice_channels(host->context, nullptr, &count);
 
 std::vector<parties::plugin::ChannelInfo> channels(count);
+for (auto& channel : channels)
+    channel.abi = parties::plugin::make_abi_header<parties::plugin::ChannelInfo>();
 size_t capacity = channels.size();
 bool complete = host->list_voice_channels(host->context,
                                           channels.data(),
@@ -531,6 +549,10 @@ struct Registration {
 ```
 
 Callbacks are optional. Null callbacks are ignored.
+Callbacks must not throw. The server catches C++ exceptions at the ABI boundary,
+logs the failure, disables the offending plugin, and removes its registered
+commands. Long-running callbacks are logged; plugins should keep callbacks
+short because they run on the server main loop.
 
 Callback timing:
 
@@ -586,6 +608,7 @@ struct CommandDefinition {
     const char* name;
     const char* description;
     const char* usage;
+    uint8_t min_role;
 };
 
 enum class CommandArgType : uint8_t {
@@ -620,6 +643,7 @@ struct ChatCommandInvocation {
     SessionId session_id;
     UserId user_id;
     ChannelId text_channel_id;
+    uint8_t caller_role;
     const char* command_name;
     const char* args;
     const char* raw_text;
@@ -631,6 +655,11 @@ struct ChatCommandInvocation {
 `usage` is also the command argument schema. The server parses it when the plugin
 registers commands, rejects invalid schemas, and parses user input before calling
 `on_chat_command`.
+
+`min_role` is the least-privileged role allowed to invoke the command. Role
+values use the server role ordering: `0 = Owner`, `1 = Admin`, `2 = Moderator`,
+`3 = User`, `4 = Bot`; lower numbers are more privileged. The default
+zero-initialized C++ SDK value is `User`.
 
 Schema syntax:
 
@@ -675,11 +704,14 @@ Command invocation rules:
 - A user sends normal chat text such as `/play https://example`.
 - If the first token matches a registered command, the server dispatches the
   command to the owning plugin.
+- If the caller role is less privileged than `min_role`, the server returns
+  `Permission denied` and does not call the plugin.
 - Registered command invocations are not stored as normal chat.
 - Unknown slash commands return a server error.
 - Missing required arguments, invalid typed values, and extra arguments return a
   server error before the plugin callback runs.
 - `args` contains the raw argument text after the command name.
+- `caller_role` contains the invoking user's current server role.
 - `parsed_args` contains one entry per schema argument. Optional missing
   arguments are present with `present == 0`.
 - Pointers in `ChatCommandInvocation` are valid only during the callback.
@@ -837,6 +869,7 @@ void describe_user(const parties::plugin::ChatCommandInvocation* invocation) {
         return;
 
     parties::plugin::UserInfo user{};
+    user.abi = parties::plugin::make_abi_header<parties::plugin::UserInfo>();
     if (!g_host.get_user_info(g_host.context, invocation->user_id, &user))
         return;
 
@@ -892,10 +925,14 @@ The server handles plugin failures as follows:
 - Missing plugin directories log a warning and startup continues.
 - Bad manifests, unsupported API versions, denied plugin ids, failed library
   loads, and failed init calls disable only that plugin.
+- Duplicate plugin ids are rejected.
+- Plugin callback exceptions are caught, logged, and disable the offending
+  plugin.
 - Missing permissions make host calls fail and log a warning.
 - Invalid or duplicate commands are rejected and logged.
 - Missing `parties_plugin_shutdown` is allowed.
-- Native crashes are process crashes.
+- Native crashes, memory corruption, and infinite loops are process/server
+  failures; plugins are trusted in-process code, not sandboxed code.
 
 ## Build Integration
 

@@ -97,6 +97,7 @@ struct CommandDefinition {
     const char* name;
     const char* description;
     const char* usage;
+    uint8_t min_role = 3; // Role::User by numeric convention; lower is more privileged.
 };
 
 struct PluginVariable {
@@ -110,6 +111,7 @@ struct ChatCommandInvocation {
     SessionId session_id;
     UserId user_id;
     ChannelId text_channel_id;
+    uint8_t caller_role;
     const char* command_name;
     const char* args;
     const char* raw_text;

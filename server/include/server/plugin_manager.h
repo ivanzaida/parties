@@ -70,6 +70,7 @@ public:
     bool dispatch_chat_command(plugin::SessionId session,
                                plugin::UserId user_id,
                                plugin::ChannelId text_channel_id,
+                               uint8_t caller_role,
                                std::string_view command_name,
                                std::string_view args,
                                std::string_view raw_text,
@@ -104,6 +105,7 @@ public:
         std::string name;
         std::string description;
         std::string usage;
+        uint8_t min_role = 3;
         std::vector<Argument> arguments;
     };
 
@@ -189,10 +191,14 @@ private:
                                 const plugin::CommandDefinition* commands,
                                 size_t command_count);
     Bot* get_owned_bot(Plugin& plugin, plugin::BotHandle bot) const;
+    void reap_destroyed_bots(Plugin& plugin);
     std::optional<plugin::ChannelId> bot_voice_channel(plugin::UserId user_id) const;
     bool check_host_permission(Plugin& plugin, std::string_view permission, std::string_view action) const;
     bool has_permission(const Plugin& plugin, std::string_view permission) const;
     Plugin* find_command_owner(std::string_view command_name) const;
+    void disable_plugin(Plugin& plugin, std::string_view reason);
+    template <typename Fn>
+    bool invoke_plugin_callback(Plugin& plugin, const char* callback_name, Fn&& fn);
 
     HostServices services_;
     std::unordered_map<std::string, PluginGrant> grants_;
