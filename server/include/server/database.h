@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <mutex>
 #include <optional>
 
 struct sqlite3;
@@ -135,10 +136,12 @@ public:
     bool has_any_users();
 
 private:
+    void close_unlocked();
     bool exec(const std::string& sql);
     bool create_schema();
 
     sqlite3* db_ = nullptr;
+    std::mutex mutex_;
 };
 
 } // namespace parties::server
