@@ -39,6 +39,33 @@ Out of scope for the current API:
 - Voice receive/transcription hooks.
 - Process isolation or sandboxing.
 
+## Scope Boundaries
+
+This feature defines the server plugin ABI and the host functions documented in
+this file. It does not turn every existing Parties subsystem into a public,
+thread-safe extension surface.
+
+Threading support applies to the documented `Host` functions only. Plugins may
+call those functions from plugin-owned worker threads, for example to pace bot
+audio, and must treat them as blocking calls. This is not a general scheduler or
+timer API, and plugins must still own, stop, and join their worker threads.
+
+Bot users are persistent synthetic users. The stable identity is `(plugin_id,
+key)`, and `destroy_bot_user` invalidates the runtime handle without deleting
+the persisted user row. Ephemeral bot database cleanup and broader user-row
+lifecycle policy are outside this feature.
+
+Command authorization for plugin commands is limited to `CommandDefinition`
+`min_role` plus the `caller_role` value passed to callbacks. Richer server-side
+policy, named command permissions, and admin/moderation mutation APIs are outside
+this feature.
+
+`AbiHeader` is enforced for this plugin ABI: the host rejects major-version
+mismatches and copies only the common prefix for output structs. It is not a
+general C++ binary-compatibility layer for arbitrary compiler, packing, or
+calling-convention differences. Plugins must build against the public C ABI
+header for the target platform.
+
 ## Directory Layout
 
 Plugins are discovered by recursively scanning the configured plugin directory

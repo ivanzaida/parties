@@ -146,6 +146,16 @@ bool command_def_has_min_role(const plugin::CommandDefinition& command) {
         offsetof(plugin::CommandDefinition, min_role) + sizeof(command.min_role);
 }
 
+constexpr size_t MIN_COMMAND_DEFINITION_SIZE =
+    offsetof(plugin::CommandDefinition, usage) + sizeof(const char*);
+
+const plugin::CommandDefinition* command_at(const plugin::CommandDefinition* commands,
+                                            size_t index,
+                                            size_t stride) {
+    auto* base = reinterpret_cast<const unsigned char*>(commands);
+    return reinterpret_cast<const plugin::CommandDefinition*>(base + index * stride);
+}
+
 std::string normalize_sha256(std::string value) {
     value.erase(std::remove_if(value.begin(), value.end(), [](unsigned char c) {
         return c == ':' || c == '-' || std::isspace(c);
@@ -1926,12 +1936,21 @@ bool PluginManager::register_chat_commands(Plugin& plugin,
             plugin.last_error = "create_chat_commands received null command array";
         return false;
     }
+    size_t command_stride = sizeof(plugin::CommandDefinition);
+    if (command_count > 0 && commands) {
+        command_stride = commands[0].abi.size;
+        if (commands[0].abi.api_major != plugin::API_VERSION_MAJOR ||
+            command_stride < MIN_COMMAND_DEFINITION_SIZE) {
+            command_stride = sizeof(plugin::CommandDefinition);
+        }
+    }
 
     bool all_ok = true;
     for (size_t i = 0; i < command_count; ++i) {
-        const auto& cmd = commands[i];
+        const auto& cmd = *command_at(commands, i, command_stride);
         if (!valid_abi_header<plugin::CommandDefinition>(cmd.abi) ||
-            cmd.abi.size != sizeof(plugin::CommandDefinition) ||
+            cmd.abi.size != command_stride ||
+            cmd.abi.size < MIN_COMMAND_DEFINITION_SIZE ||
             !cmd.name || !cmd.description || !cmd.usage || !valid_command_name(cmd.name)) {
             LOG_WARN("Plugin '{}' provided invalid chat command at index {}", plugin.id, i);
             if (plugin.last_error.empty()) {
