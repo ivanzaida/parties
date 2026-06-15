@@ -24,6 +24,15 @@
 
 namespace parties::server {
 
+template <size_t N>
+static void copy_plugin_string(char (&dst)[N], std::string_view src) {
+    static_assert(N > 0);
+    const size_t max_len = N - 1;
+    const size_t n = src.size() < max_len ? src.size() : max_len;
+    std::memcpy(dst, src.data(), n);
+    dst[n] = '\0';
+}
+
 Server::Server() = default;
 Server::~Server() { stop(); }
 
@@ -126,6 +135,123 @@ bool Server::start(const Config& cfg) {
                                                    size_t opus_payload_len) {
         return send_plugin_bot_voice_packet(user_id, voice_channel_id, sequence,
                                             opus_payload, opus_payload_len);
+    };
+    plugin_services.user_voice_channel = [this](UserId user_id) -> std::optional<ChannelId> {
+        auto sessions = quic_.get_sessions();
+        for (const auto& session : sessions) {
+            if (session->authenticated && session->user_id == user_id)
+                return session->channel_id;
+        }
+        return std::nullopt;
+    };
+    plugin_services.get_session_info = [this](plugin::SessionId session_id) -> std::optional<plugin::SessionInfo> {
+        auto session = quic_.get_session(session_id);
+        if (!session)
+            return std::nullopt;
+
+        plugin::SessionInfo info{};
+        info.abi = plugin::make_abi_header<plugin::SessionInfo>();
+        info.session_id = session->id;
+        info.user_id = session->user_id;
+        info.voice_channel_id = session->channel_id;
+        info.role = static_cast<uint8_t>(session->role);
+        info.authenticated = session->authenticated ? 1 : 0;
+        info.muted = session->muted ? 1 : 0;
+        info.deafened = session->deafened ? 1 : 0;
+        copy_plugin_string(info.username, session->username);
+        return info;
+    };
+    plugin_services.get_user_info = [this](plugin::UserId user_id) -> std::optional<plugin::UserInfo> {
+        auto user = db_.get_user_by_id(user_id);
+        if (!user)
+            return std::nullopt;
+
+        plugin::UserInfo info{};
+        info.abi = plugin::make_abi_header<plugin::UserInfo>();
+        info.user_id = user->id;
+        info.role = static_cast<uint8_t>(user->role);
+        info.is_bot = user->is_bot ? 1 : 0;
+        copy_plugin_string(info.display_name, user->display_name);
+        copy_plugin_string(info.fingerprint, user->fingerprint);
+        copy_plugin_string(info.bot_owner_plugin, user->bot_owner_plugin);
+        copy_plugin_string(info.bot_key, user->bot_key);
+        return info;
+    };
+    plugin_services.find_user_by_name = [this](std::string_view display_name) -> std::optional<plugin::UserId> {
+        auto users = db_.get_all_users();
+        auto it = std::find_if(users.begin(), users.end(), [&](const UserRow& user) {
+            return user.display_name == display_name;
+        });
+        if (it == users.end())
+            return std::nullopt;
+        return it->id;
+    };
+    auto voice_user_count = [this](ChannelId channel_id) {
+        uint32_t count = plugins_.bot_voice_count(channel_id);
+        auto sessions = quic_.get_sessions();
+        for (const auto& session : sessions) {
+            if (session->authenticated && session->channel_id == channel_id)
+                ++count;
+        }
+        return count;
+    };
+    plugin_services.get_voice_channel_info = [this, voice_user_count](plugin::ChannelId channel_id)
+        -> std::optional<plugin::ChannelInfo> {
+        auto channel = db_.get_channel(channel_id);
+        if (!channel)
+            return std::nullopt;
+
+        plugin::ChannelInfo info{};
+        info.abi = plugin::make_abi_header<plugin::ChannelInfo>();
+        info.channel_id = channel->id;
+        info.user_count = voice_user_count(channel->id);
+        info.max_users = channel->max_users;
+        info.sort_order = channel->sort_order;
+        copy_plugin_string(info.name, channel->name);
+        return info;
+    };
+    plugin_services.get_text_channel_info = [this](plugin::ChannelId channel_id)
+        -> std::optional<plugin::ChannelInfo> {
+        auto channel = db_.get_text_channel(channel_id);
+        if (!channel)
+            return std::nullopt;
+
+        plugin::ChannelInfo info{};
+        info.abi = plugin::make_abi_header<plugin::ChannelInfo>();
+        info.channel_id = channel->id;
+        info.sort_order = channel->sort_order;
+        copy_plugin_string(info.name, channel->name);
+        return info;
+    };
+    plugin_services.list_voice_channels = [this, voice_user_count]() {
+        std::vector<plugin::ChannelInfo> result;
+        auto channels = db_.get_all_channels();
+        result.reserve(channels.size());
+        for (const auto& channel : channels) {
+            plugin::ChannelInfo info{};
+            info.abi = plugin::make_abi_header<plugin::ChannelInfo>();
+            info.channel_id = channel.id;
+            info.user_count = voice_user_count(channel.id);
+            info.max_users = channel.max_users;
+            info.sort_order = channel.sort_order;
+            copy_plugin_string(info.name, channel.name);
+            result.push_back(info);
+        }
+        return result;
+    };
+    plugin_services.list_text_channels = [this]() {
+        std::vector<plugin::ChannelInfo> result;
+        auto channels = db_.get_all_text_channels();
+        result.reserve(channels.size());
+        for (const auto& channel : channels) {
+            plugin::ChannelInfo info{};
+            info.abi = plugin::make_abi_header<plugin::ChannelInfo>();
+            info.channel_id = channel.id;
+            info.sort_order = channel.sort_order;
+            copy_plugin_string(info.name, channel.name);
+            result.push_back(info);
+        }
+        return result;
     };
     plugins_.set_host_services(std::move(plugin_services));
 
@@ -1495,8 +1621,11 @@ void Server::handle_message(const IncomingMessage& msg) {
                 break;
             }
 
+            std::string command_error;
             if (plugins_.dispatch_chat_command(msg.session_id, session->user_id, channel_id,
-                                               command_name, args, text)) {
+                                               command_name, args, text, &command_error)) {
+                if (!command_error.empty())
+                    send_error(msg.session_id, command_error);
                 break;
             }
 

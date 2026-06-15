@@ -44,6 +44,14 @@ public:
                            uint16_t sequence,
                            const uint8_t* opus_payload,
                            size_t opus_payload_len)> send_bot_voice_packet;
+        std::function<std::optional<plugin::ChannelId>(plugin::UserId user_id)> user_voice_channel;
+        std::function<std::optional<plugin::SessionInfo>(plugin::SessionId session)> get_session_info;
+        std::function<std::optional<plugin::UserInfo>(plugin::UserId user_id)> get_user_info;
+        std::function<std::optional<plugin::UserId>(std::string_view display_name)> find_user_by_name;
+        std::function<std::optional<plugin::ChannelInfo>(plugin::ChannelId channel_id)> get_voice_channel_info;
+        std::function<std::optional<plugin::ChannelInfo>(plugin::ChannelId channel_id)> get_text_channel_info;
+        std::function<std::vector<plugin::ChannelInfo>()> list_voice_channels;
+        std::function<std::vector<plugin::ChannelInfo>()> list_text_channels;
     };
 
     void set_host_services(HostServices services);
@@ -63,7 +71,8 @@ public:
                                plugin::ChannelId text_channel_id,
                                std::string_view command_name,
                                std::string_view args,
-                               std::string_view raw_text);
+                               std::string_view raw_text,
+                               std::string* error_message = nullptr);
 
     enum class ChatResultCode {
         Continue,
@@ -83,10 +92,18 @@ public:
                                     uint8_t attachment_count);
 
     struct ChatCommand {
+        struct Argument {
+            std::string name;
+            plugin::CommandArgType type = plugin::CommandArgType::String;
+            bool required = true;
+            bool rest = false;
+        };
+
         std::string plugin_id;
         std::string name;
         std::string description;
         std::string usage;
+        std::vector<Argument> arguments;
     };
 
     struct BotVoiceParticipant {
@@ -135,12 +152,43 @@ private:
                                            uint16_t sequence,
                                            const uint8_t* opus_payload,
                                            size_t opus_payload_len);
+    static bool host_user_voice_channel(void* context,
+                                        plugin::UserId user_id,
+                                        plugin::ChannelId* out_voice_channel_id);
+    static bool host_get_session_info(void* context,
+                                      plugin::SessionId session,
+                                      plugin::SessionInfo* out_info);
+    static bool host_get_user_info(void* context,
+                                   plugin::UserId user_id,
+                                   plugin::UserInfo* out_info);
+    static bool host_find_user_by_name(void* context,
+                                       const char* display_name,
+                                       plugin::UserId* out_user_id);
+    static bool host_get_voice_channel_info(void* context,
+                                            plugin::ChannelId channel_id,
+                                            plugin::ChannelInfo* out_info);
+    static bool host_get_text_channel_info(void* context,
+                                           plugin::ChannelId channel_id,
+                                           plugin::ChannelInfo* out_info);
+    static bool host_list_voice_channels(void* context,
+                                         plugin::ChannelInfo* out_channels,
+                                         size_t* inout_count);
+    static bool host_list_text_channels(void* context,
+                                        plugin::ChannelInfo* out_channels,
+                                        size_t* inout_count);
+    static bool host_bot_voice_channel(void* context,
+                                       plugin::BotHandle bot,
+                                       plugin::ChannelId* out_voice_channel_id);
+    static bool host_move_bot_to_user_voice(void* context,
+                                            plugin::BotHandle bot,
+                                            plugin::UserId user_id);
 
     bool load_manifest(const std::filesystem::path& manifest_path);
     bool register_chat_commands(Plugin& plugin,
                                 const plugin::CommandDefinition* commands,
                                 size_t command_count);
     Bot* get_owned_bot(Plugin& plugin, plugin::BotHandle bot) const;
+    std::optional<plugin::ChannelId> bot_voice_channel(plugin::UserId user_id) const;
     bool check_host_permission(Plugin& plugin, std::string_view permission, std::string_view action) const;
     bool has_permission(const Plugin& plugin, std::string_view permission) const;
     Plugin* find_command_owner(std::string_view command_name) const;

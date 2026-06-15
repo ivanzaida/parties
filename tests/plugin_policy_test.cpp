@@ -1,5 +1,6 @@
 #include <server/plugin_manager.h>
 
+#include <cstdlib>
 #include <cstdio>
 #include <filesystem>
 
@@ -22,6 +23,12 @@ static bool has_command(const PluginManager& plugins, const char* name) {
 }
 
 int main() {
+#ifdef _WIN32
+    _putenv_s("PARTIES_BOT_ECHO_PREFIX", "manifest");
+#else
+    setenv("PARTIES_BOT_ECHO_PREFIX", "manifest", 1);
+#endif
+
     auto tmp = fs::temp_directory_path() / "parties_plugin_policy_test";
     fs::remove_all(tmp);
     fs::create_directories(tmp / "plugins");
@@ -53,6 +60,9 @@ int main() {
         TEST_ASSERT(plugins.load(cfg), "load explicitly allowed plugin");
         TEST_ASSERT(has_command(plugins, "botping"), "allowed plugin registers botping");
         TEST_ASSERT(has_command(plugins, "botjoin"), "allowed plugin registers botjoin");
+        TEST_ASSERT(has_command(plugins, "botapi"), "allowed plugin registers botapi");
+        TEST_ASSERT(has_command(plugins, "bottypes"), "allowed plugin registers bottypes");
+        TEST_ASSERT(has_command(plugins, "botvars"), "allowed plugin registers botvars");
     }
 
     {

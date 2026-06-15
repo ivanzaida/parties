@@ -12,7 +12,7 @@ struct ChatConfig {
     int64_t     max_total_file_storage = 1024LL * 1024 * 1024; // 1 GB
     std::string file_retention         = "time";               // "none", "time", "ring"
     int         file_retention_days    = 30;
-    std::string file_storage_path      = "files";
+    std::string file_storage_path      = ".parties/files";
     int         message_retention_days = 0;                    // 0 = keep forever
 };
 
@@ -35,10 +35,10 @@ struct Config {
     int         max_clients    = 64;
     std::string server_password;
 
-    std::string cert_file      = "server.pem";
-    std::string key_file       = "server.key.pem";
+    std::string cert_file      = ".parties/server.pem";
+    std::string key_file       = ".parties/server.key.pem";
 
-    std::string db_path        = "parties.db";
+    std::string db_path        = ".parties/parties.db";
 
     // Identity: fingerprints that get ROOT (Owner) role
     std::vector<std::string> root_fingerprints;

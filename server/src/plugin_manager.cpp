@@ -5,9 +5,13 @@
 #include <toml.hpp>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cctype>
+#include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <map>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -81,10 +85,13 @@ struct PluginManager::Plugin {
     std::filesystem::path manifest_path;
     std::filesystem::path library_path;
     std::unordered_set<std::string> permissions;
+    std::vector<std::pair<std::string, std::string>> variables;
+    std::vector<plugin::PluginVariable> host_variables;
     NativeLibrary library;
     plugin::Registration registration{};
     plugin::ShutdownFn shutdown = nullptr;
     std::vector<std::unique_ptr<Bot>> bots;
+    std::string last_error;
 };
 
 PluginManager::PluginManager() = default;
@@ -107,6 +114,445 @@ static bool valid_command_name(std::string_view name) {
     return true;
 }
 
+static bool valid_argument_name(std::string_view name) {
+    if (name.empty() || name.size() > 64)
+        return false;
+    for (char c : name) {
+        unsigned char uc = static_cast<unsigned char>(c);
+        if (!(std::isalnum(uc) || c == '_'))
+            return false;
+    }
+    return true;
+}
+
+static std::string_view trim_ascii(std::string_view s) {
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front())))
+        s.remove_prefix(1);
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back())))
+        s.remove_suffix(1);
+    return s;
+}
+
+static bool parse_arg_type(std::string_view text,
+                           plugin::CommandArgType& type,
+                           bool& rest) {
+    rest = false;
+    if (text == "string...") {
+        type = plugin::CommandArgType::String;
+        rest = true;
+        return true;
+    }
+    if (text == "string") {
+        type = plugin::CommandArgType::String;
+        return true;
+    }
+    if (text == "bool") {
+        type = plugin::CommandArgType::Bool;
+        return true;
+    }
+    if (text == "int8") {
+        type = plugin::CommandArgType::Int8;
+        return true;
+    }
+    if (text == "uint8") {
+        type = plugin::CommandArgType::UInt8;
+        return true;
+    }
+    if (text == "int16") {
+        type = plugin::CommandArgType::Int16;
+        return true;
+    }
+    if (text == "uint16") {
+        type = plugin::CommandArgType::UInt16;
+        return true;
+    }
+    if (text == "int32") {
+        type = plugin::CommandArgType::Int32;
+        return true;
+    }
+    if (text == "uint32") {
+        type = plugin::CommandArgType::UInt32;
+        return true;
+    }
+    if (text == "int64") {
+        type = plugin::CommandArgType::Int64;
+        return true;
+    }
+    if (text == "uint64") {
+        type = plugin::CommandArgType::UInt64;
+        return true;
+    }
+    if (text == "float") {
+        type = plugin::CommandArgType::Float;
+        return true;
+    }
+    if (text == "double") {
+        type = plugin::CommandArgType::Double;
+        return true;
+    }
+    return false;
+}
+
+static bool read_schema_token(std::string_view input, size_t& pos, std::string_view& token) {
+    while (pos < input.size() && std::isspace(static_cast<unsigned char>(input[pos])))
+        ++pos;
+    if (pos >= input.size())
+        return false;
+
+    size_t start = pos;
+    while (pos < input.size() && !std::isspace(static_cast<unsigned char>(input[pos])))
+        ++pos;
+    token = input.substr(start, pos - start);
+    return true;
+}
+
+static std::optional<std::vector<PluginManager::ChatCommand::Argument>> parse_command_usage_schema(
+    std::string_view command_name,
+    std::string_view usage,
+    std::string& error) {
+    std::vector<PluginManager::ChatCommand::Argument> args;
+
+    size_t pos = 0;
+    std::string_view token;
+    if (!read_schema_token(usage, pos, token)) {
+        error = "usage is empty";
+        return std::nullopt;
+    }
+
+    std::string expected = "/";
+    expected += command_name;
+    if (token != expected) {
+        error = "usage must start with " + expected;
+        return std::nullopt;
+    }
+
+    bool saw_optional = false;
+    while (read_schema_token(usage, pos, token)) {
+        bool required = false;
+        if (token.size() >= 3 && token.front() == '{' && token.back() == '}') {
+            required = true;
+        } else if (token.size() >= 3 && token.front() == '[' && token.back() == ']') {
+            required = false;
+            saw_optional = true;
+        } else {
+            error = "usage token '" + std::string(token) + "' is not a typed placeholder";
+            return std::nullopt;
+        }
+
+        if (required && saw_optional) {
+            error = "required arguments cannot follow optional arguments";
+            return std::nullopt;
+        }
+
+        std::string_view inner = token.substr(1, token.size() - 2);
+        size_t colon = inner.find(':');
+        if (colon == std::string_view::npos) {
+            error = "argument '" + std::string(inner) + "' is missing a type";
+            return std::nullopt;
+        }
+
+        std::string_view name = inner.substr(0, colon);
+        std::string_view type_name = inner.substr(colon + 1);
+        if (!valid_argument_name(name)) {
+            error = "invalid argument name '" + std::string(name) + "'";
+            return std::nullopt;
+        }
+
+        plugin::CommandArgType type{};
+        bool rest = false;
+        if (!parse_arg_type(type_name, type, rest)) {
+            error = "unsupported argument type '" + std::string(type_name) + "'";
+            return std::nullopt;
+        }
+        if (rest && pos < usage.size() && !trim_ascii(usage.substr(pos)).empty()) {
+            error = "string... argument must be last";
+            return std::nullopt;
+        }
+
+        auto duplicate = std::find_if(args.begin(), args.end(), [&](const auto& arg) {
+            return arg.name == name;
+        });
+        if (duplicate != args.end()) {
+            error = "duplicate argument name '" + std::string(name) + "'";
+            return std::nullopt;
+        }
+
+        args.push_back(PluginManager::ChatCommand::Argument{
+            std::string(name),
+            type,
+            required,
+            rest,
+        });
+    }
+
+    return args;
+}
+
+static bool read_invocation_token(std::string_view input,
+                                  size_t& pos,
+                                  std::string& token,
+                                  std::string& error) {
+    token.clear();
+    while (pos < input.size() && std::isspace(static_cast<unsigned char>(input[pos])))
+        ++pos;
+    if (pos >= input.size())
+        return false;
+
+    char quote = 0;
+    if (input[pos] == '"' || input[pos] == '\'') {
+        quote = input[pos++];
+    }
+
+    while (pos < input.size()) {
+        char c = input[pos++];
+        if (quote) {
+            if (c == quote)
+                return true;
+            if (c == '\\' && pos < input.size()) {
+                token.push_back(input[pos++]);
+                continue;
+            }
+            token.push_back(c);
+            continue;
+        }
+
+        if (std::isspace(static_cast<unsigned char>(c)))
+            return true;
+        token.push_back(c);
+    }
+
+    if (quote) {
+        error = "unterminated quoted string";
+        return false;
+    }
+    return true;
+}
+
+static bool parse_signed_integer(const std::string& token,
+                                 int64_t min_value,
+                                 int64_t max_value,
+                                 int64_t& out) {
+    if (token.empty())
+        return false;
+    char* end = nullptr;
+    errno = 0;
+    long long value = std::strtoll(token.c_str(), &end, 10);
+    if (errno == ERANGE || !end || *end != '\0')
+        return false;
+    if (value < min_value || value > max_value)
+        return false;
+    out = static_cast<int64_t>(value);
+    return true;
+}
+
+static bool parse_unsigned_integer(const std::string& token,
+                                   uint64_t max_value,
+                                   uint64_t& out) {
+    if (token.empty() || token[0] == '-')
+        return false;
+    char* end = nullptr;
+    errno = 0;
+    unsigned long long value = std::strtoull(token.c_str(), &end, 10);
+    if (errno == ERANGE || !end || *end != '\0')
+        return false;
+    if (value > max_value)
+        return false;
+    out = static_cast<uint64_t>(value);
+    return true;
+}
+
+static bool parse_bool_value(const std::string& token, uint8_t& out) {
+    std::string lower;
+    lower.reserve(token.size());
+    for (char c : token)
+        lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+
+    if (lower == "true" || lower == "1") {
+        out = 1;
+        return true;
+    }
+    if (lower == "false" || lower == "0") {
+        out = 0;
+        return true;
+    }
+    return false;
+}
+
+static bool parse_float_value(const std::string& token, double& out) {
+    if (token.empty())
+        return false;
+    char* end = nullptr;
+    errno = 0;
+    double value = std::strtod(token.c_str(), &end);
+    if (errno == ERANGE || !end || *end != '\0')
+        return false;
+    out = value;
+    return true;
+}
+
+static const char* command_arg_type_name(plugin::CommandArgType type) {
+    switch (type) {
+    case plugin::CommandArgType::String: return "string";
+    case plugin::CommandArgType::Bool: return "bool";
+    case plugin::CommandArgType::Int8: return "int8";
+    case plugin::CommandArgType::UInt8: return "uint8";
+    case plugin::CommandArgType::Int16: return "int16";
+    case plugin::CommandArgType::UInt16: return "uint16";
+    case plugin::CommandArgType::Int32: return "int32";
+    case plugin::CommandArgType::UInt32: return "uint32";
+    case plugin::CommandArgType::Int64: return "int64";
+    case plugin::CommandArgType::UInt64: return "uint64";
+    case plugin::CommandArgType::Float: return "float";
+    case plugin::CommandArgType::Double: return "double";
+    }
+    return "unknown";
+}
+
+static bool fill_argument_value(const PluginManager::ChatCommand::Argument& arg,
+                                const std::string& token,
+                                plugin::CommandArgumentValue& value,
+                                std::string& error) {
+    value.abi = plugin::make_abi_header<plugin::CommandArgumentValue>();
+    value.name = arg.name.c_str();
+    value.type = static_cast<uint8_t>(arg.type);
+    value.present = 1;
+
+    switch (arg.type) {
+    case plugin::CommandArgType::String:
+        return true;
+    case plugin::CommandArgType::Bool:
+        if (parse_bool_value(token, value.bool_value))
+            return true;
+        break;
+    case plugin::CommandArgType::Int8:
+        if (parse_signed_integer(token,
+                                 (std::numeric_limits<int8_t>::min)(),
+                                 (std::numeric_limits<int8_t>::max)(),
+                                 value.i64_value))
+            return true;
+        break;
+    case plugin::CommandArgType::UInt8:
+        if (parse_unsigned_integer(token, (std::numeric_limits<uint8_t>::max)(), value.u64_value))
+            return true;
+        break;
+    case plugin::CommandArgType::Int16:
+        if (parse_signed_integer(token,
+                                 (std::numeric_limits<int16_t>::min)(),
+                                 (std::numeric_limits<int16_t>::max)(),
+                                 value.i64_value))
+            return true;
+        break;
+    case plugin::CommandArgType::UInt16:
+        if (parse_unsigned_integer(token, (std::numeric_limits<uint16_t>::max)(), value.u64_value))
+            return true;
+        break;
+    case plugin::CommandArgType::Int32:
+        if (parse_signed_integer(token,
+                                 (std::numeric_limits<int32_t>::min)(),
+                                 (std::numeric_limits<int32_t>::max)(),
+                                 value.i64_value))
+            return true;
+        break;
+    case plugin::CommandArgType::UInt32:
+        if (parse_unsigned_integer(token, (std::numeric_limits<uint32_t>::max)(), value.u64_value))
+            return true;
+        break;
+    case plugin::CommandArgType::Int64:
+        if (parse_signed_integer(token,
+                                 (std::numeric_limits<int64_t>::min)(),
+                                 (std::numeric_limits<int64_t>::max)(),
+                                 value.i64_value))
+            return true;
+        break;
+    case plugin::CommandArgType::UInt64:
+        if (parse_unsigned_integer(token, (std::numeric_limits<uint64_t>::max)(), value.u64_value))
+            return true;
+        break;
+    case plugin::CommandArgType::Float:
+    case plugin::CommandArgType::Double:
+        if (parse_float_value(token, value.f64_value))
+            return true;
+        break;
+    }
+
+    error = "Invalid argument " + arg.name + ": expected " + command_arg_type_name(arg.type);
+    return false;
+}
+
+static bool parse_invocation_arguments(
+    const std::vector<PluginManager::ChatCommand::Argument>& schema,
+    std::string_view input,
+    std::vector<plugin::CommandArgumentValue>& values,
+    std::vector<std::string>& string_storage,
+    std::string& error) {
+    values.clear();
+    string_storage.clear();
+    values.reserve(schema.size());
+    string_storage.reserve(schema.size());
+
+    size_t pos = 0;
+    for (const auto& arg : schema) {
+        plugin::CommandArgumentValue value{};
+        value.abi = plugin::make_abi_header<plugin::CommandArgumentValue>();
+        value.name = arg.name.c_str();
+        value.type = static_cast<uint8_t>(arg.type);
+        value.present = 0;
+
+        if (arg.rest) {
+            std::string_view rest = trim_ascii(input.substr(pos));
+            if (rest.empty()) {
+                if (arg.required) {
+                    error = "Missing required argument " + arg.name;
+                    return false;
+                }
+                values.push_back(value);
+                continue;
+            }
+
+            string_storage.emplace_back(rest);
+            value.present = 1;
+            value.string_value = string_storage.back().c_str();
+            values.push_back(value);
+            pos = input.size();
+            continue;
+        }
+
+        std::string token;
+        std::string token_error;
+        if (!read_invocation_token(input, pos, token, token_error)) {
+            if (!token_error.empty()) {
+                error = token_error;
+                return false;
+            }
+            if (arg.required) {
+                error = "Missing required argument " + arg.name;
+                return false;
+            }
+            values.push_back(value);
+            continue;
+        }
+
+        if (arg.type == plugin::CommandArgType::String) {
+            string_storage.emplace_back(std::move(token));
+            value.present = 1;
+            value.string_value = string_storage.back().c_str();
+            values.push_back(value);
+            continue;
+        }
+
+        if (!fill_argument_value(arg, token, value, error))
+            return false;
+        values.push_back(value);
+    }
+
+    if (!trim_ascii(input.substr(pos)).empty()) {
+        error = "Unexpected extra argument";
+        return false;
+    }
+
+    return true;
+}
+
 static std::vector<std::string> read_string_array(const toml::value& value,
                                                   const char* key) {
     std::vector<std::string> result;
@@ -117,6 +563,45 @@ static std::vector<std::string> read_string_array(const toml::value& value,
     } catch (const std::exception& e) {
         LOG_WARN("Plugin manifest field '{}' is not a string array: {}", key, e.what());
     }
+    return result;
+}
+
+static std::optional<std::vector<std::pair<std::string, std::string>>> read_plugin_variables(
+    const toml::value& manifest,
+    std::string& error) {
+    std::vector<std::pair<std::string, std::string>> result;
+    if (!manifest.contains("variables"))
+        return result;
+
+    try {
+        auto variables = toml::find<std::map<std::string, std::string>>(manifest, "variables");
+        result.reserve(variables.size());
+        for (auto& [key, value] : variables) {
+            if (key.empty()) {
+                error = "variables table contains an empty key";
+                return std::nullopt;
+            }
+            if (value.rfind("env:", 0) == 0) {
+                std::string env_name = value.substr(4);
+                if (env_name.empty()) {
+                    error = "variable '" + key + "' uses an empty environment variable name";
+                    return std::nullopt;
+                }
+                const char* env_value = std::getenv(env_name.c_str());
+                if (!env_value) {
+                    error = "variable '" + key + "' references missing environment variable '" +
+                        env_name + "'";
+                    return std::nullopt;
+                }
+                value = env_value;
+            }
+            result.emplace_back(std::move(key), std::move(value));
+        }
+    } catch (const std::exception& e) {
+        error = e.what();
+        return std::nullopt;
+    }
+
     return result;
 }
 
@@ -216,6 +701,22 @@ bool PluginManager::load_manifest(const std::filesystem::path& manifest_path) {
         }
     }
 
+    std::string variables_error;
+    auto variables = read_plugin_variables(manifest, variables_error);
+    if (!variables) {
+        LOG_WARN("Plugin '{}' has invalid variables table: {}", plugin->id, variables_error);
+        return false;
+    }
+    plugin->variables = std::move(*variables);
+    plugin->host_variables.reserve(plugin->variables.size());
+    for (const auto& [key, value] : plugin->variables) {
+        plugin->host_variables.push_back(plugin::PluginVariable{
+            plugin::make_abi_header<plugin::PluginVariable>(),
+            key.c_str(),
+            value.c_str(),
+        });
+    }
+
     plugin->library_path = manifest_path.parent_path() / library;
     if (!plugin->library.open(plugin->library_path)) {
         LOG_WARN("Failed to load plugin '{}' from '{}'", plugin->id, plugin->library_path.string());
@@ -242,6 +743,18 @@ bool PluginManager::load_manifest(const std::filesystem::path& manifest_path) {
     host.join_bot_voice = &PluginManager::host_join_bot_voice;
     host.leave_bot_voice = &PluginManager::host_leave_bot_voice;
     host.send_bot_voice_packet = &PluginManager::host_send_bot_voice_packet;
+    host.user_voice_channel = &PluginManager::host_user_voice_channel;
+    host.get_session_info = &PluginManager::host_get_session_info;
+    host.get_user_info = &PluginManager::host_get_user_info;
+    host.find_user_by_name = &PluginManager::host_find_user_by_name;
+    host.get_voice_channel_info = &PluginManager::host_get_voice_channel_info;
+    host.get_text_channel_info = &PluginManager::host_get_text_channel_info;
+    host.list_voice_channels = &PluginManager::host_list_voice_channels;
+    host.list_text_channels = &PluginManager::host_list_text_channels;
+    host.bot_voice_channel = &PluginManager::host_bot_voice_channel;
+    host.move_bot_to_user_voice = &PluginManager::host_move_bot_to_user_voice;
+    host.variables = plugin->host_variables.empty() ? nullptr : plugin->host_variables.data();
+    host.variable_count = plugin->host_variables.size();
 
     plugin->registration = {};
     plugin->registration.abi = plugin::make_abi_header<plugin::Registration>();
@@ -249,7 +762,19 @@ bool PluginManager::load_manifest(const std::filesystem::path& manifest_path) {
     const size_t commands_before_init = chat_commands_.size();
     if (!init(&host, &plugin->registration)) {
         chat_commands_.resize(commands_before_init);
-        LOG_WARN("Plugin '{}' init failed", plugin->id);
+        if (!plugin->last_error.empty()) {
+            LOG_WARN("Plugin '{}' init failed: {} (manifest='{}', library='{}')",
+                     plugin->id,
+                     plugin->last_error,
+                     plugin->manifest_path.string(),
+                     plugin->library_path.string());
+        } else {
+            LOG_WARN("Plugin '{}' init failed: parties_plugin_init returned false "
+                     "without reporting a host-side error (manifest='{}', library='{}')",
+                     plugin->id,
+                     plugin->manifest_path.string(),
+                     plugin->library_path.string());
+        }
         return false;
     }
 
@@ -332,14 +857,38 @@ bool PluginManager::dispatch_chat_command(plugin::SessionId session,
                                           plugin::ChannelId text_channel_id,
                                           std::string_view command_name,
                                           std::string_view args,
-                                          std::string_view raw_text) {
-    Plugin* owner = find_command_owner(command_name);
+                                          std::string_view raw_text,
+                                          std::string* error_message) {
+    if (error_message)
+        error_message->clear();
+
+    auto command = std::find_if(chat_commands_.begin(), chat_commands_.end(),
+        [&](const ChatCommand& cmd) { return cmd.name == command_name; });
+    if (command == chat_commands_.end())
+        return false;
+
+    Plugin* owner = nullptr;
+    for (const auto& plugin : plugins_) {
+        if (plugin->id == command->plugin_id) {
+            owner = plugin.get();
+            break;
+        }
+    }
     if (!owner)
         return false;
 
     if (!owner->registration.on_chat_command) {
         LOG_WARN("Plugin '{}' owns command '{}' but has no on_chat_command callback",
                  owner->id, command_name);
+        return true;
+    }
+
+    std::vector<plugin::CommandArgumentValue> parsed_args;
+    std::vector<std::string> string_storage;
+    std::string parse_error;
+    if (!parse_invocation_arguments(command->arguments, args, parsed_args, string_storage, parse_error)) {
+        if (error_message)
+            *error_message = parse_error;
         return true;
     }
 
@@ -355,6 +904,8 @@ bool PluginManager::dispatch_chat_command(plugin::SessionId session,
     invocation.command_name = command_name_copy.c_str();
     invocation.args = args_copy.c_str();
     invocation.raw_text = raw_text_copy.c_str();
+    invocation.parsed_args = parsed_args.empty() ? nullptr : parsed_args.data();
+    invocation.parsed_arg_count = parsed_args.size();
 
     owner->registration.on_chat_command(&invocation);
     return true;
@@ -658,19 +1209,272 @@ bool PluginManager::host_send_bot_voice_packet(void* context,
         bot->user_id, bot->voice_channel_id, sequence, opus_payload, opus_payload_len);
 }
 
+bool PluginManager::host_user_voice_channel(void* context,
+                                            plugin::UserId user_id,
+                                            plugin::ChannelId* out_voice_channel_id) {
+    if (out_voice_channel_id)
+        *out_voice_channel_id = 0;
+
+    auto* plugin = static_cast<Plugin*>(context);
+    if (!plugin || !plugin->manager || !out_voice_channel_id || user_id == 0)
+        return false;
+    if (!plugin->manager->check_host_permission(*plugin, "read_sessions", "read user voice channel"))
+        return false;
+
+    if (auto channel = plugin->manager->bot_voice_channel(user_id)) {
+        *out_voice_channel_id = *channel;
+        return true;
+    }
+
+    if (!plugin->manager->services_.user_voice_channel) {
+        LOG_WARN("Plugin '{}' tried to read user voice channel, but session lookup is unavailable",
+                 plugin->id);
+        return false;
+    }
+
+    auto channel = plugin->manager->services_.user_voice_channel(user_id);
+    if (!channel)
+        return false;
+
+    *out_voice_channel_id = *channel;
+    return true;
+}
+
+static bool copy_channel_list(const std::vector<plugin::ChannelInfo>& channels,
+                              plugin::ChannelInfo* out_channels,
+                              size_t* inout_count) {
+    if (!inout_count)
+        return false;
+
+    const size_t capacity = *inout_count;
+    *inout_count = channels.size();
+
+    if (!out_channels)
+        return true;
+
+    const size_t to_copy = capacity < channels.size() ? capacity : channels.size();
+    for (size_t i = 0; i < to_copy; ++i)
+        out_channels[i] = channels[i];
+
+    return capacity >= channels.size();
+}
+
+bool PluginManager::host_get_session_info(void* context,
+                                          plugin::SessionId session,
+                                          plugin::SessionInfo* out_info) {
+    if (out_info)
+        *out_info = {};
+
+    auto* plugin = static_cast<Plugin*>(context);
+    if (!plugin || !plugin->manager || !out_info || session == 0)
+        return false;
+    if (!plugin->manager->check_host_permission(*plugin, "read_sessions", "read session info"))
+        return false;
+    if (!plugin->manager->services_.get_session_info)
+        return false;
+
+    auto info = plugin->manager->services_.get_session_info(session);
+    if (!info)
+        return false;
+
+    *out_info = *info;
+    return true;
+}
+
+bool PluginManager::host_get_user_info(void* context,
+                                       plugin::UserId user_id,
+                                       plugin::UserInfo* out_info) {
+    if (out_info)
+        *out_info = {};
+
+    auto* plugin = static_cast<Plugin*>(context);
+    if (!plugin || !plugin->manager || !out_info || user_id == 0)
+        return false;
+    if (!plugin->manager->check_host_permission(*plugin, "read_users", "read user info"))
+        return false;
+    if (!plugin->manager->services_.get_user_info)
+        return false;
+
+    auto info = plugin->manager->services_.get_user_info(user_id);
+    if (!info)
+        return false;
+
+    *out_info = *info;
+    return true;
+}
+
+bool PluginManager::host_find_user_by_name(void* context,
+                                           const char* display_name,
+                                           plugin::UserId* out_user_id) {
+    if (out_user_id)
+        *out_user_id = 0;
+
+    auto* plugin = static_cast<Plugin*>(context);
+    if (!plugin || !plugin->manager || !out_user_id || !display_name || !display_name[0])
+        return false;
+    if (!plugin->manager->check_host_permission(*plugin, "read_users", "find user by name"))
+        return false;
+    if (!plugin->manager->services_.find_user_by_name)
+        return false;
+
+    auto user_id = plugin->manager->services_.find_user_by_name(display_name);
+    if (!user_id || *user_id == 0)
+        return false;
+
+    *out_user_id = *user_id;
+    return true;
+}
+
+bool PluginManager::host_get_voice_channel_info(void* context,
+                                                plugin::ChannelId channel_id,
+                                                plugin::ChannelInfo* out_info) {
+    if (out_info)
+        *out_info = {};
+
+    auto* plugin = static_cast<Plugin*>(context);
+    if (!plugin || !plugin->manager || !out_info || channel_id == 0)
+        return false;
+    if (!plugin->manager->check_host_permission(*plugin, "read_channels", "read voice channel info"))
+        return false;
+    if (!plugin->manager->services_.get_voice_channel_info)
+        return false;
+
+    auto info = plugin->manager->services_.get_voice_channel_info(channel_id);
+    if (!info)
+        return false;
+
+    *out_info = *info;
+    return true;
+}
+
+bool PluginManager::host_get_text_channel_info(void* context,
+                                               plugin::ChannelId channel_id,
+                                               plugin::ChannelInfo* out_info) {
+    if (out_info)
+        *out_info = {};
+
+    auto* plugin = static_cast<Plugin*>(context);
+    if (!plugin || !plugin->manager || !out_info || channel_id == 0)
+        return false;
+    if (!plugin->manager->check_host_permission(*plugin, "read_channels", "read text channel info"))
+        return false;
+    if (!plugin->manager->services_.get_text_channel_info)
+        return false;
+
+    auto info = plugin->manager->services_.get_text_channel_info(channel_id);
+    if (!info)
+        return false;
+
+    *out_info = *info;
+    return true;
+}
+
+bool PluginManager::host_list_voice_channels(void* context,
+                                             plugin::ChannelInfo* out_channels,
+                                             size_t* inout_count) {
+    auto* plugin = static_cast<Plugin*>(context);
+    if (!plugin || !plugin->manager || !inout_count)
+        return false;
+    if (!plugin->manager->check_host_permission(*plugin, "read_channels", "list voice channels"))
+        return false;
+    if (!plugin->manager->services_.list_voice_channels)
+        return false;
+
+    return copy_channel_list(plugin->manager->services_.list_voice_channels(),
+                             out_channels, inout_count);
+}
+
+bool PluginManager::host_list_text_channels(void* context,
+                                            plugin::ChannelInfo* out_channels,
+                                            size_t* inout_count) {
+    auto* plugin = static_cast<Plugin*>(context);
+    if (!plugin || !plugin->manager || !inout_count)
+        return false;
+    if (!plugin->manager->check_host_permission(*plugin, "read_channels", "list text channels"))
+        return false;
+    if (!plugin->manager->services_.list_text_channels)
+        return false;
+
+    return copy_channel_list(plugin->manager->services_.list_text_channels(),
+                             out_channels, inout_count);
+}
+
+bool PluginManager::host_bot_voice_channel(void* context,
+                                           plugin::BotHandle bot_handle,
+                                           plugin::ChannelId* out_voice_channel_id) {
+    if (out_voice_channel_id)
+        *out_voice_channel_id = 0;
+
+    auto* plugin = static_cast<Plugin*>(context);
+    if (!plugin || !plugin->manager || !out_voice_channel_id)
+        return false;
+
+    Bot* bot = plugin->manager->get_owned_bot(*plugin, bot_handle);
+    if (!bot)
+        return false;
+
+    *out_voice_channel_id = bot->voice_channel_id;
+    return true;
+}
+
+bool PluginManager::host_move_bot_to_user_voice(void* context,
+                                                plugin::BotHandle bot_handle,
+                                                plugin::UserId user_id) {
+    auto* plugin = static_cast<Plugin*>(context);
+    if (!plugin || !plugin->manager || user_id == 0)
+        return false;
+    if (!plugin->manager->check_host_permission(*plugin, "read_sessions", "resolve user voice channel"))
+        return false;
+
+    plugin::ChannelId voice_channel_id = 0;
+    if (auto channel = plugin->manager->bot_voice_channel(user_id)) {
+        voice_channel_id = *channel;
+    } else {
+        if (!plugin->manager->services_.user_voice_channel)
+            return false;
+        auto session_channel = plugin->manager->services_.user_voice_channel(user_id);
+        if (!session_channel)
+            return false;
+        voice_channel_id = *session_channel;
+    }
+
+    if (voice_channel_id == 0)
+        return false;
+
+    return host_join_bot_voice(context, bot_handle, voice_channel_id);
+}
+
 bool PluginManager::register_chat_commands(Plugin& plugin,
                                            const plugin::CommandDefinition* commands,
                                            size_t command_count) {
     if (!check_host_permission(plugin, "create_chat_commands", "register chat commands"))
         return false;
-    if (!commands && command_count != 0)
+    if (!commands && command_count != 0) {
+        if (plugin.last_error.empty())
+            plugin.last_error = "create_chat_commands received null command array";
         return false;
+    }
 
     bool all_ok = true;
     for (size_t i = 0; i < command_count; ++i) {
         const auto& cmd = commands[i];
         if (!cmd.name || !cmd.description || !cmd.usage || !valid_command_name(cmd.name)) {
             LOG_WARN("Plugin '{}' provided invalid chat command at index {}", plugin.id, i);
+            if (plugin.last_error.empty()) {
+                plugin.last_error = "invalid chat command at index " + std::to_string(i);
+            }
+            all_ok = false;
+            continue;
+        }
+        std::string schema_error;
+        auto arguments = parse_command_usage_schema(cmd.name, cmd.usage, schema_error);
+        if (!arguments) {
+            LOG_WARN("Plugin '{}' provided invalid usage for command '{}': {}",
+                     plugin.id, cmd.name, schema_error);
+            if (plugin.last_error.empty()) {
+                plugin.last_error = "invalid usage for command '" + std::string(cmd.name) +
+                    "': " + schema_error;
+            }
             all_ok = false;
             continue;
         }
@@ -678,6 +1482,9 @@ bool PluginManager::register_chat_commands(Plugin& plugin,
             [&](const ChatCommand& existing) { return existing.name == cmd.name; });
         if (duplicate != chat_commands_.end()) {
             LOG_WARN("Plugin '{}' tried to register duplicate chat command '{}'", plugin.id, cmd.name);
+            if (plugin.last_error.empty()) {
+                plugin.last_error = "duplicate chat command '" + std::string(cmd.name) + "'";
+            }
             all_ok = false;
             continue;
         }
@@ -686,6 +1493,7 @@ bool PluginManager::register_chat_commands(Plugin& plugin,
             cmd.name,
             cmd.description,
             cmd.usage,
+            std::move(*arguments),
         });
         LOG_INFO("Plugin '{}' registered chat command /{}", plugin.id, cmd.name);
     }
@@ -707,12 +1515,26 @@ PluginManager::Bot* PluginManager::get_owned_bot(Plugin& plugin, plugin::BotHand
     return bot;
 }
 
+std::optional<plugin::ChannelId> PluginManager::bot_voice_channel(plugin::UserId user_id) const {
+    for (const auto& owner : plugins_) {
+        for (const auto& bot : owner->bots) {
+            if (!bot->destroyed && bot->user_id == user_id)
+                return bot->voice_channel_id;
+        }
+    }
+    return std::nullopt;
+}
+
 bool PluginManager::check_host_permission(Plugin& plugin,
                                           std::string_view permission,
                                           std::string_view action) const {
     if (has_permission(plugin, permission))
         return true;
 
+    if (plugin.last_error.empty()) {
+        plugin.last_error = "missing permission '" + std::string(permission) +
+            "' while trying to " + std::string(action);
+    }
     LOG_WARN("Plugin '{}' tried to {} without '{}' permission",
              plugin.id, action, permission);
     return false;

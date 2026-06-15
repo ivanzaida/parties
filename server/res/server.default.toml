@@ -7,11 +7,11 @@ max_clients = 64
 password = ""
 
 [tls]
-cert_file = "server.der"
-key_file = "server.key.der"
+cert_file = ".parties/server.pem"
+key_file = ".parties/server.key.pem"
 
 [database]
-path = "parties.db"
+path = ".parties/parties.db"
 
 [auth]
 admin_password = "changeme"
@@ -28,11 +28,14 @@ level = "info"
 enabled = false
 directory = "plugins"
 
-# Plugins are default-deny. Add an allow entry for each plugin id you trust.
+#Plugins are default-deny. Add an allow entry for each plugin id you trust.
 # [[plugins.allow]]
 # id = "parties.example.bot_echo"
 # enabled = true
 # permissions = [
+#   "read_sessions",
+#   "read_users",
+#   "read_channels",
 #   "create_chat_commands",
 #   "create_bot_users",
 #   "send_bot_chat",

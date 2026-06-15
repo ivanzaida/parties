@@ -3,6 +3,10 @@
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/sinks/rotating_file_sink.h>
 
+#include <cstdlib>
+#include <filesystem>
+#include <string>
+
 #ifdef _WIN32
 #include <spdlog/sinks/msvc_sink.h>
 #elif defined(__APPLE__)
@@ -13,6 +17,14 @@
 #endif
 
 namespace parties {
+
+static std::string server_log_path() {
+    if (const char* path = std::getenv("PARTIES_LOG_FILE"); path && path[0])
+        return path;
+
+    std::filesystem::create_directories(".parties");
+    return ".parties/parties_server.log";
+}
 
 #ifdef __APPLE__
 // os_log sink for macOS — maps spdlog levels to os_log levels
@@ -71,7 +83,7 @@ void log_init(LogTarget target) {
     } else {
         // Server: rotating log file (5 MB, 3 rotated files) + stdout
         sinks.push_back(std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
-            "parties_server.log", 5 * 1024 * 1024, 3));
+            server_log_path(), 5 * 1024 * 1024, 3));
         sinks.push_back(std::make_shared<spdlog::sinks::stdout_color_sink_mt>());
     }
 

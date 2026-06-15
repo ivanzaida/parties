@@ -22,6 +22,41 @@ using MessageId = uint64_t;
 struct Bot;
 using BotHandle = Bot*;
 
+constexpr size_t MAX_NAME_LEN = 128;
+constexpr size_t MAX_FINGERPRINT_LEN = 192;
+
+struct SessionInfo {
+    AbiHeader abi;
+    SessionId session_id;
+    UserId user_id;
+    ChannelId voice_channel_id;
+    uint8_t role;
+    uint8_t authenticated;
+    uint8_t muted;
+    uint8_t deafened;
+    char username[MAX_NAME_LEN];
+};
+
+struct UserInfo {
+    AbiHeader abi;
+    UserId user_id;
+    uint8_t role;
+    uint8_t is_bot;
+    char display_name[MAX_NAME_LEN];
+    char fingerprint[MAX_FINGERPRINT_LEN];
+    char bot_owner_plugin[MAX_NAME_LEN];
+    char bot_key[MAX_NAME_LEN];
+};
+
+struct ChannelInfo {
+    AbiHeader abi;
+    ChannelId channel_id;
+    uint32_t user_count;
+    int32_t max_users;
+    int32_t sort_order;
+    char name[MAX_NAME_LEN];
+};
+
 enum class LogLevel : uint8_t {
     Trace = 0,
     Debug = 1,
@@ -30,11 +65,44 @@ enum class LogLevel : uint8_t {
     Error = 4,
 };
 
+enum class CommandArgType : uint8_t {
+    String = 0,
+    Bool = 1,
+    Int8 = 2,
+    UInt8 = 3,
+    Int16 = 4,
+    UInt16 = 5,
+    Int32 = 6,
+    UInt32 = 7,
+    Int64 = 8,
+    UInt64 = 9,
+    Float = 10,
+    Double = 11,
+};
+
+struct CommandArgumentValue {
+    AbiHeader abi;
+    const char* name;
+    uint8_t type;
+    uint8_t present;
+    int64_t i64_value;
+    uint64_t u64_value;
+    double f64_value;
+    uint8_t bool_value;
+    const char* string_value;
+};
+
 struct CommandDefinition {
     AbiHeader abi;
     const char* name;
     const char* description;
     const char* usage;
+};
+
+struct PluginVariable {
+    AbiHeader abi;
+    const char* key;
+    const char* value;
 };
 
 struct ChatCommandInvocation {
@@ -45,6 +113,8 @@ struct ChatCommandInvocation {
     const char* command_name;
     const char* args;
     const char* raw_text;
+    const CommandArgumentValue* parsed_args;
+    size_t parsed_arg_count;
 };
 
 struct ChatMessage {
@@ -106,6 +176,43 @@ struct Host {
                                   uint16_t sequence,
                                   const uint8_t* opus_payload,
                                   size_t opus_payload_len);
+
+    bool (*user_voice_channel)(void* context,
+                               UserId user_id,
+                               ChannelId* out_voice_channel_id);
+
+    bool (*get_session_info)(void* context,
+                             SessionId session,
+                             SessionInfo* out_info);
+    bool (*get_user_info)(void* context,
+                          UserId user_id,
+                          UserInfo* out_info);
+    bool (*find_user_by_name)(void* context,
+                              const char* display_name,
+                              UserId* out_user_id);
+
+    bool (*get_voice_channel_info)(void* context,
+                                   ChannelId channel_id,
+                                   ChannelInfo* out_info);
+    bool (*get_text_channel_info)(void* context,
+                                  ChannelId channel_id,
+                                  ChannelInfo* out_info);
+    bool (*list_voice_channels)(void* context,
+                                ChannelInfo* out_channels,
+                                size_t* inout_count);
+    bool (*list_text_channels)(void* context,
+                               ChannelInfo* out_channels,
+                               size_t* inout_count);
+
+    bool (*bot_voice_channel)(void* context,
+                              BotHandle bot,
+                              ChannelId* out_voice_channel_id);
+    bool (*move_bot_to_user_voice)(void* context,
+                                   BotHandle bot,
+                                   UserId user_id);
+
+    const PluginVariable* variables;
+    size_t variable_count;
 };
 
 struct Registration {

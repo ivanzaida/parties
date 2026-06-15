@@ -41,6 +41,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -187,6 +188,9 @@ static LONG WINAPI crash_handler(EXCEPTION_POINTERS* ep) {
 int main() {
 #ifdef _WIN32
     SetUnhandledExceptionFilter(crash_handler);
+    _putenv_s("PARTIES_BOT_ECHO_PREFIX", "manifest");
+#else
+    setenv("PARTIES_BOT_ECHO_PREFIX", "manifest", 1);
 #endif
     LOG("=== Parties Integration Test ===\n\n");
 
@@ -218,7 +222,8 @@ int main() {
     cfg.plugins.allow.push_back(PluginConfig::Allow{
         "parties.example.bot_echo",
         true,
-        {"create_chat_commands", "create_bot_users", "send_bot_chat",
+        {"read_sessions", "read_users", "read_channels",
+         "create_chat_commands", "create_bot_users", "send_bot_chat",
          "join_bot_voice", "send_bot_audio"}
     });
 
@@ -300,6 +305,9 @@ int main() {
         BinaryReader cr(command_payload.data(), command_payload.size());
         uint16_t command_count = cr.read_u16();
         bool found_botping = false;
+        bool found_botapi = false;
+        bool found_bottypes = false;
+        bool found_botvars = false;
         for (uint16_t i = 0; i < command_count; ++i) {
             std::string name = cr.read_string();
             std::string description = cr.read_string();
@@ -308,9 +316,18 @@ int main() {
             (void)usage;
             if (name == "botping")
                 found_botping = true;
+            if (name == "botapi")
+                found_botapi = true;
+            if (name == "bottypes")
+                found_bottypes = true;
+            if (name == "botvars")
+                found_botvars = true;
         }
         TEST_ASSERT(!cr.error(), "client A command list parse");
         TEST_ASSERT(found_botping, "botping command advertised");
+        TEST_ASSERT(found_botapi, "botapi command advertised");
+        TEST_ASSERT(found_bottypes, "bottypes command advertised");
+        TEST_ASSERT(found_botvars, "botvars command advertised");
 
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         drain_messages(client_a);
@@ -546,6 +563,92 @@ int main() {
         TEST_ASSERT(!lr.error(), "bot leave parse");
     }
     LOG("[plugin] Bot voice join/audio/leave verified\n");
+
+    LOG("[plugin] Testing plugin host ABI lookup helpers...\n");
+    {
+        BinaryWriter api;
+        api.write_u32(1);
+        api.write_string("/botapi test_user_b");
+        api.write_u8(0);
+        TEST_ASSERT(client_a.send_message(ControlMessageType::CHAT_SEND,
+                    api.data().data(), api.data().size()), "client A send /botapi");
+
+        std::vector<uint8_t> payload;
+        std::vector<std::pair<ControlMessageType, std::vector<uint8_t>>> side;
+        TEST_ASSERT(wait_for_message_collecting(client_a, ControlMessageType::CHAT_MESSAGE,
+                    payload, side), "client A receives /botapi result");
+
+        BinaryReader r(payload.data(), payload.size());
+        (void)r.read_u64();
+        TEST_ASSERT(r.read_u32() == 1, "botapi chat channel id");
+        TEST_ASSERT(r.read_u32() == plugin_bot_user_id, "botapi sender is bot");
+        TEST_ASSERT(r.read_string() == "Bot Echo", "botapi sender name");
+        (void)r.read_u64();
+        std::string text = r.read_string();
+        TEST_ASSERT(!r.error(), "botapi chat parse");
+        TEST_ASSERT(text.rfind("api-ok ", 0) == 0, "botapi result ok");
+        TEST_ASSERT(text.find("self=" + std::to_string(user_a_id)) != std::string::npos,
+                    "botapi self user id");
+        TEST_ASSERT(text.find("found=" + std::to_string(user_b_id)) != std::string::npos,
+                    "botapi find_user_by_name result");
+        TEST_ASSERT(text.find("voice=1") != std::string::npos, "botapi user voice channel");
+        TEST_ASSERT(text.find("text=1") != std::string::npos, "botapi text channel");
+
+        BinaryWriter types;
+        types.write_u32(1);
+        types.write_string("/bottypes true -8 8 -16 16 -32 32 -64 64 1.5 2.25 typed note");
+        types.write_u8(0);
+        TEST_ASSERT(client_a.send_message(ControlMessageType::CHAT_SEND,
+                    types.data().data(), types.data().size()), "client A send /bottypes");
+
+        TEST_ASSERT(wait_for_message_collecting(client_a, ControlMessageType::CHAT_MESSAGE,
+                    payload, side), "client A receives /bottypes result");
+
+        BinaryReader tr(payload.data(), payload.size());
+        (void)tr.read_u64();
+        TEST_ASSERT(tr.read_u32() == 1, "bottypes chat channel id");
+        TEST_ASSERT(tr.read_u32() == plugin_bot_user_id, "bottypes sender is bot");
+        TEST_ASSERT(tr.read_string() == "Bot Echo", "bottypes sender name");
+        (void)tr.read_u64();
+        text = tr.read_string();
+        TEST_ASSERT(!tr.error(), "bottypes chat parse");
+        TEST_ASSERT(text == "types-ok note=typed note", "bottypes parsed all argument types");
+
+        BinaryWriter vars;
+        vars.write_u32(1);
+        vars.write_string("/botvars");
+        vars.write_u8(0);
+        TEST_ASSERT(client_a.send_message(ControlMessageType::CHAT_SEND,
+                    vars.data().data(), vars.data().size()), "client A send /botvars");
+
+        TEST_ASSERT(wait_for_message_collecting(client_a, ControlMessageType::CHAT_MESSAGE,
+                    payload, side), "client A receives /botvars result");
+
+        BinaryReader vr(payload.data(), payload.size());
+        (void)vr.read_u64();
+        TEST_ASSERT(vr.read_u32() == 1, "botvars chat channel id");
+        TEST_ASSERT(vr.read_u32() == plugin_bot_user_id, "botvars sender is bot");
+        TEST_ASSERT(vr.read_string() == "Bot Echo", "botvars sender name");
+        (void)vr.read_u64();
+        text = vr.read_string();
+        TEST_ASSERT(!vr.error(), "botvars chat parse");
+        TEST_ASSERT(text == "vars-ok echoPrefix=manifest", "botvars read manifest variable");
+
+        BinaryWriter leave;
+        leave.write_u32(1);
+        leave.write_string("/botleave");
+        leave.write_u8(0);
+        TEST_ASSERT(client_a.send_message(ControlMessageType::CHAT_SEND,
+                    leave.data().data(), leave.data().size()), "client A send /botleave after /botapi");
+
+        TEST_ASSERT(wait_for_message(client_b, ControlMessageType::USER_LEFT_CHANNEL, payload),
+                    "client B receives bot left channel after /botapi");
+        BinaryReader lr(payload.data(), payload.size());
+        TEST_ASSERT(lr.read_u32() == plugin_bot_user_id, "botapi cleanup leave user id");
+        TEST_ASSERT(lr.read_u32() == 1, "botapi cleanup leave channel id");
+        TEST_ASSERT(!lr.error(), "botapi cleanup leave parse");
+    }
+    LOG("[plugin] Host ABI lookup helpers verified\n");
 
     // ── Client A: encode PCM silence and send as voice ──
     LOG("[7/15] Sending voice data...\n");
