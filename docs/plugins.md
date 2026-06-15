@@ -983,6 +983,7 @@ runtime plugin directory. It registers these commands:
 - `/botapi [displayName:string]`
 - `/bottypes {flag:bool} {i8:int8} {u8:uint8} {i16:int16} {u16:uint16} {i32:int32} {u32:uint32} {i64:int64} {u64:uint64} {f:float} {d:double} [note:string...]`
 - `/botvars`
+- `/botworker`
 
 `/botapi` is an integration-test command that exercises the read-only lookup
 host APIs and bot voice helper APIs through the real plugin boundary.
@@ -992,3 +993,6 @@ argument parser through the real plugin boundary.
 
 `/botvars` is an integration-test command that echoes a value read from
 `plugin.toml` during plugin init.
+
+`/botworker` is an integration-test command that exercises a host call from a
+plugin-owned worker thread.

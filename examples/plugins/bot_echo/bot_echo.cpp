@@ -1,7 +1,10 @@
 #include <parties/plugin_api.h>
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
+#include <thread>
 
 #ifdef _WIN32
 #define PARTIES_PLUGIN_EXPORT extern "C" __declspec(dllexport)
@@ -14,6 +17,9 @@ namespace {
 parties::plugin::Host g_host{};
 parties::plugin::BotHandle g_bot = nullptr;
 parties::plugin::UserId g_bot_user_id = 0;
+std::mutex g_bot_mutex;
+std::thread g_worker;
+std::atomic<bool> g_worker_running{false};
 char g_echo_prefix[64] = "unset";
 
 void log_info(const char* message) {
@@ -22,6 +28,7 @@ void log_info(const char* message) {
 }
 
 bool ensure_bot() {
+    std::lock_guard<std::mutex> lock(g_bot_mutex);
     if (g_bot)
         return true;
     if (!g_host.create_bot_user)
@@ -33,7 +40,12 @@ void send_bot_text(parties::plugin::ChannelId text_channel_id, const char* text)
     if (!ensure_bot() || !g_host.send_bot_chat)
         return;
     parties::plugin::MessageId message_id = 0;
-    g_host.send_bot_chat(g_host.context, g_bot, text_channel_id, text, &message_id);
+    parties::plugin::BotHandle bot = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_bot_mutex);
+        bot = g_bot;
+    }
+    g_host.send_bot_chat(g_host.context, bot, text_channel_id, text, &message_id);
 }
 
 void send_api_failure(parties::plugin::ChannelId text_channel_id, const char* step) {
@@ -269,10 +281,15 @@ void on_chat_command(const parties::plugin::ChatCommandInvocation* invocation) {
     }
 
     if (std::strcmp(invocation->command_name, "botreset") == 0) {
-        if (g_host.destroy_bot_user && g_bot)
-            g_host.destroy_bot_user(g_host.context, g_bot);
-        g_bot = nullptr;
-        g_bot_user_id = 0;
+        parties::plugin::BotHandle bot = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(g_bot_mutex);
+            bot = g_bot;
+            g_bot = nullptr;
+            g_bot_user_id = 0;
+        }
+        if (g_host.destroy_bot_user && bot)
+            g_host.destroy_bot_user(g_host.context, bot);
         return;
     }
 
@@ -292,9 +309,14 @@ void on_chat_command(const parties::plugin::ChatCommandInvocation* invocation) {
     if (std::strcmp(invocation->command_name, "botvoice") == 0) {
         if (!ensure_bot() || !g_host.send_bot_voice_packet)
             return;
+        parties::plugin::BotHandle bot = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(g_bot_mutex);
+            bot = g_bot;
+        }
         static uint16_t sequence = 0;
         const uint8_t opus_payload[] = {0xf8, 0xff, 0xfe};
-        g_host.send_bot_voice_packet(g_host.context, g_bot, sequence++,
+        g_host.send_bot_voice_packet(g_host.context, bot, sequence++,
                                      opus_payload, sizeof(opus_payload));
         return;
     }
@@ -313,6 +335,53 @@ void on_chat_command(const parties::plugin::ChatCommandInvocation* invocation) {
         on_botvars(invocation);
         return;
     }
+
+    if (std::strcmp(invocation->command_name, "botworker") == 0) {
+        if (!ensure_bot())
+            return;
+        if (g_worker.joinable() && !g_worker_running)
+            g_worker.join();
+        if (g_worker.joinable()) {
+            send_bot_text(invocation->text_channel_id, "worker-busy");
+            return;
+        }
+
+        parties::plugin::UserId user_id = invocation->user_id;
+        parties::plugin::ChannelId text_channel_id = invocation->text_channel_id;
+        g_worker_running = true;
+        g_worker = std::thread([user_id, text_channel_id]() {
+            parties::plugin::UserInfo user{};
+            user.abi = parties::plugin::make_abi_header<parties::plugin::UserInfo>();
+            if (!g_host.get_user_info ||
+                !g_host.get_user_info(g_host.context, user_id, &user)) {
+                send_bot_text(text_channel_id, "worker-fail");
+                g_worker_running = false;
+                return;
+            }
+            char msg[192];
+            std::snprintf(msg, sizeof(msg), "worker-ok user=%u name=%s",
+                          user.user_id, user.display_name);
+            send_bot_text(text_channel_id, msg);
+            g_worker_running = false;
+        });
+        return;
+    }
+}
+
+void on_chat_message(const parties::plugin::ChatMessage* message,
+                     parties::plugin::ChatDecision* decision) {
+    if (!message || !message->text || !decision)
+        return;
+    if (std::strcmp(message->text, "bot-moderate-reject") == 0) {
+        decision->code = static_cast<uint8_t>(parties::plugin::ChatDecisionCode::Reject);
+        decision->rejection_reason = "bot moderation rejected";
+        return;
+    }
+    if (std::strcmp(message->text, "bot-moderate-replace") == 0) {
+        decision->code = static_cast<uint8_t>(parties::plugin::ChatDecisionCode::ReplaceText);
+        decision->replacement_text = "bot moderation replaced";
+        return;
+    }
 }
 
 } // namespace
@@ -326,7 +395,7 @@ PARTIES_PLUGIN_EXPORT bool parties_plugin_init(const parties::plugin::Host* host
     if (const char* echo_prefix = find_variable(host, "echo_prefix"))
         std::snprintf(g_echo_prefix, sizeof(g_echo_prefix), "%s", echo_prefix);
 
-    parties::plugin::CommandDefinition commands[8]{};
+    parties::plugin::CommandDefinition commands[9]{};
     commands[0].abi = parties::plugin::make_abi_header<parties::plugin::CommandDefinition>();
     commands[0].name = "botping";
     commands[0].description = "Send a test message as a server bot.";
@@ -359,21 +428,43 @@ PARTIES_PLUGIN_EXPORT bool parties_plugin_init(const parties::plugin::Host* host
     commands[7].name = "botvars";
     commands[7].description = "Echo plugin manifest variables.";
     commands[7].usage = "/botvars";
+    commands[8].abi = parties::plugin::make_abi_header<parties::plugin::CommandDefinition>();
+    commands[8].name = "botworker";
+    commands[8].description = "Exercise worker-thread host calls.";
+    commands[8].usage = "/botworker";
 
-    if (!g_host.create_chat_commands(g_host.context, commands, 8))
+    if (!g_host.create_chat_commands(g_host.context, commands, 9))
         return false;
+
+    if (const char* mode = find_variable(host, "mode")) {
+        if (std::strcmp(mode, "init_false_after_commands") == 0)
+            return false;
+        if (std::strcmp(mode, "bad_registration_abi") == 0) {
+            registration->abi = parties::plugin::make_abi_header<parties::plugin::Registration>();
+            registration->abi.api_major = parties::plugin::API_VERSION_MAJOR + 1;
+            return true;
+        }
+    }
 
     registration->abi = parties::plugin::make_abi_header<parties::plugin::Registration>();
     registration->on_chat_command = &on_chat_command;
+    registration->on_chat_message = &on_chat_message;
 
     log_info("bot_echo initialized");
     return true;
 }
 
 PARTIES_PLUGIN_EXPORT void parties_plugin_shutdown() {
-    if (g_host.destroy_bot_user && g_bot)
-        g_host.destroy_bot_user(g_host.context, g_bot);
-    g_bot = nullptr;
-    g_bot_user_id = 0;
+    if (g_worker.joinable())
+        g_worker.join();
+    parties::plugin::BotHandle bot = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_bot_mutex);
+        bot = g_bot;
+        g_bot = nullptr;
+        g_bot_user_id = 0;
+    }
+    if (g_host.destroy_bot_user && bot)
+        g_host.destroy_bot_user(g_host.context, bot);
     log_info("bot_echo shutdown");
 }
