@@ -7,11 +7,11 @@ max_clients = 64
 password = ""
 
 [tls]
-cert_file = ".parties/server.pem"
-key_file = ".parties/server.key.pem"
+cert_file = "server.pem"
+key_file = "server.key.pem"
 
 [database]
-path = ".parties/parties.db"
+path = "parties.db"
 
 [auth]
 admin_password = "changeme"
