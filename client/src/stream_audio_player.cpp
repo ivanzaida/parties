@@ -1,4 +1,5 @@
 #include <client/stream_audio_player.h>
+#include <parties/audio_common.h>
 #include <parties/profiler.h>
 
 #include <parties/log.h>
@@ -59,7 +60,7 @@ void StreamAudioPlayer::mix_output(float* output, int frame_count) {
 
     if (!decoder_initialized_) return;
 
-    float vol = volume_.load(std::memory_order_relaxed);
+    float vol = audio::volume_position_to_gain(volume_.load(std::memory_order_relaxed));
     int written = 0;
 
     while (written < frame_count) {

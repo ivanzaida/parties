@@ -1,5 +1,6 @@
 #include <client/sound_player.h>
 
+#include <parties/audio_common.h>
 #include <parties/log.h>
 
 #include <algorithm>
@@ -155,7 +156,7 @@ void SoundPlayer::data_callback(ma_device* device, void* output,
     auto* out = static_cast<float*>(output);
     std::memset(out, 0, frame_count * sizeof(float));
 
-    float vol = self->volume_.load(std::memory_order_relaxed);
+    float vol = audio::volume_position_to_gain(self->volume_.load(std::memory_order_relaxed));
 
     for (auto& slot : self->playing_) {
         int fx = slot.effect.load(std::memory_order_acquire);

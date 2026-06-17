@@ -28,4 +28,26 @@ inline float perceptual_to_rms(float p) {
     return std::pow(10.0f, db / 20.0f);
 }
 
+// Volume control: bottom-of-slider attenuation and top-of-slider boost (dB).
+constexpr float VOLUME_FLOOR_DB     = -40.0f;  // pos→0 attenuation before mute
+constexpr float VOLUME_MAX_BOOST_DB =  6.0f;   // +6 dB ≈ 2x amplitude at pos 2.0
+
+// Map a volume-slider position (0..2, where 1.0 = unity / 0 dB) to a linear
+// amplitude gain along a perceptual (dB) curve. Loudness perception is roughly
+// logarithmic, so multiplying samples by the raw slider position makes the
+// control feel dead across its top half and crammed near the bottom. Here equal
+// slider movements yield roughly equal loudness (dB) changes instead:
+//   pos 0    → 0      (true mute)
+//   pos 0..1 → -40 dB .. 0 dB
+//   pos 1    → unity  (0 dB)
+//   pos 1..2 → 0 dB .. +6 dB
+inline float volume_position_to_gain(float pos) {
+    pos = std::clamp(pos, 0.0f, 2.0f);
+    if (pos <= 0.0f) return 0.0f;
+    const float db = (pos >= 1.0f)
+        ? (pos - 1.0f) * VOLUME_MAX_BOOST_DB
+        : (1.0f - pos) * VOLUME_FLOOR_DB;
+    return std::pow(10.0f, db / 20.0f);
+}
+
 } // namespace parties::audio

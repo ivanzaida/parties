@@ -157,8 +157,11 @@ void VoiceMixer::mix_output(float* output, int frame_count) {
                 stream.compress_gain += alpha * (desired_gain - stream.compress_gain);
             }
 
-            // Mix this user's decoded PCM into output
-            float vol = stream.volume * (stream.compress ? stream.compress_gain : 1.0f);
+            // Mix this user's decoded PCM into output. The stored volume is the
+            // slider position (0..2); map it through the perceptual curve so the
+            // control feels linear to the ear. Compression gain stays linear.
+            float vol = audio::volume_position_to_gain(stream.volume)
+                      * (stream.compress ? stream.compress_gain : 1.0f);
             for (int i = 0; i < chunk; i++) {
                 output[written + i] += stream.pcm_buf[stream.pcm_pos + i] * vol;
             }
