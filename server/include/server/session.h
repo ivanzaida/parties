@@ -20,6 +20,7 @@ struct Session {
 
     // Authenticated state (set after AUTH_RESPONSE)
     bool             authenticated = false;
+    uint16_t         client_protocol_version = 0;
     UserId           user_id = 0;
     std::string      username;           // Display name
     int              role = 3;           // Default: User
